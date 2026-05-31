@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: transperth-browser
+    env: node
+    plan: free
+    buildCommand: npm install && npx playwright install chromium
+    startCommand: npm start
+    envVars:
+      - key: BROWSER_TOKEN
+        generateValue: true

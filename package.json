@@ -1,0 +1,17 @@
+{
+  "name": "transperth-browser",
+  "version": "1.0.0",
+  "description": "Browser service for reading Transperth mobi live stop data",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "playwright": "^1.60.0"
+  }
+}
