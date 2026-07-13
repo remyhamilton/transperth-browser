@@ -1,6 +1,6 @@
 {
   "name": "transperth-browser",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Pooled Transperth browser plus background bus service-packet prewarming",
   "main": "server.js",
   "scripts": {

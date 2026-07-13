@@ -43,7 +43,9 @@ services:
       - key: SERVICE_WARM_CONCURRENCY
         value: "2"
       - key: SERVICE_WARM_TIMEOUT_MS
-        value: "9000"
+        value: "30000"
+      - key: SERVICE_WARM_FAILED_RECENT_MS
+        value: "2000"
       - key: SERVICE_WARM_RECENT_MS
         value: "45000"
       - key: SERVICE_WARM_QUEUE_MAX
