@@ -2,11 +2,13 @@ FROM mcr.microsoft.com/playwright:v1.60.0-noble
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+COPY package.json package-lock.json ./
 
-COPY . .
+RUN npm ci --omit=dev --no-audit --no-fund
 
-ENV PORT=3000
+COPY server.js ./
+
+ENV NODE_ENV=production
 
 CMD ["npm", "start"]
+
