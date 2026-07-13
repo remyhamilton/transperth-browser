@@ -1,5 +1,12 @@
 "use strict";
 
+// Keep the Playwright browser inside the deployed project rather than Render's
+// temporary build cache. This must be set before importing Playwright.
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
+}
+
+const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const { chromium } = require("playwright");
@@ -143,6 +150,15 @@ async function ensureBrowser() {
 
   startPromise = (async () => {
     await closeBrowser();
+
+    const executablePath = chromium.executablePath();
+    if (!fs.existsSync(executablePath)) {
+      throw new Error(
+        `Playwright Chromium is missing at ${executablePath}. ` +
+        `Run the Render build command with PLAYWRIGHT_BROWSERS_PATH=0.`
+      );
+    }
+
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -320,7 +336,7 @@ async function scrapeStop(stopId, limit) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v2",
+      source: "136213-browser-v2.2",
       count: parsed.services.length,
       services: parsed.services,
       fetchedAt: new Date().toISOString(),
@@ -390,7 +406,7 @@ async function fetchStopShared(stopId, limit) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v2",
+    service: "transperth-browser-v2.2",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -479,7 +495,8 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v2 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v2.2 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Playwright Chromium: ${chromium.executablePath()}`);
   } catch (error) {
     console.error("Browser startup failed:", error);
     process.exit(1);

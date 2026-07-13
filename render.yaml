@@ -1,18 +1,17 @@
-# Proposed Blueprint alignment for the existing service.
-# Because the current dashboard labels the service as Docker while the supplied
-# Blueprint says Node, preview this Blueprint change before applying it.
 services:
   - type: web
     name: transperth-browser
-    env: node
+    runtime: node
     plan: standard
-    buildCommand: npm ci && npx playwright install chromium
-    startCommand: npm start
+    buildCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm ci --no-audit --no-fund && PLAYWRIGHT_BROWSERS_PATH=0 npx --no-install playwright install chromium
+    startCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm start
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
       - key: BROWSER_TOKEN
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
       - key: BROWSER_POOL_SIZE
         value: "2"
       - key: NAVIGATION_TIMEOUT_MS
