@@ -1,9 +1,30 @@
+# Proposed Blueprint alignment for the existing service.
+# Because the current dashboard labels the service as Docker while the supplied
+# Blueprint says Node, preview this Blueprint change before applying it.
 services:
   - type: web
     name: transperth-browser
-    env: docker
-    plan: free
-    dockerfilePath: ./Dockerfile
+    env: node
+    plan: standard
+    buildCommand: npm ci && npx playwright install chromium
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
     envVars:
       - key: BROWSER_TOKEN
-        generateValue: true
+        sync: false
+      - key: BROWSER_POOL_SIZE
+        value: "2"
+      - key: NAVIGATION_TIMEOUT_MS
+        value: "12000"
+      - key: ROW_WAIT_TIMEOUT_MS
+        value: "6500"
+      - key: QUEUE_TIMEOUT_MS
+        value: "7000"
+      - key: FRESH_CACHE_MS
+        value: "8000"
+      - key: STALE_CACHE_MS
+        value: "45000"
+      - key: MAX_CACHE_ENTRIES
+        value: "250"
+
