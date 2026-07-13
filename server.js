@@ -26,9 +26,11 @@ const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000)
 const MAX_CACHE_ENTRIES = positiveInt(process.env.MAX_CACHE_ENTRIES, 250, 10, 2000);
 const BATCH_MAX_STOPS = positiveInt(process.env.BATCH_MAX_STOPS, 60, 2, 120);
 const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT_MS, 900, 250, 4000);
-const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 12000, 1000, 120000);
-const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 90000, 5000, 600000);
-const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 40, 4, 250);
+const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
+const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
+const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 80, 4, 250);
+const BATCH_KEEP_WARM_MS = positiveInt(process.env.BATCH_KEEP_WARM_MS, 900000, 60000, 3600000);
+const BATCH_REFRESH_INTERVAL_MS = positiveInt(process.env.BATCH_REFRESH_INTERVAL_MS, 45000, 10000, 300000);
 const WORKER_BASE_URL = String(
   process.env.WORKER_BASE_URL || "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
 ).trim().replace(/\/$/, "");
@@ -323,6 +325,7 @@ function getBatchCache(key, allowStale = false) {
     if (entry.staleUntil <= now) batchCache.delete(key);
     return null;
   }
+  entry.lastRequestedAt = now;
   batchCache.delete(key);
   batchCache.set(key, entry);
   return {
@@ -336,7 +339,10 @@ function setBatchCache(key, payload) {
   const now = Date.now();
   batchCache.set(key, {
     payload: structuredCloneSafe(payload),
+    stopIds: Array.isArray(payload?.stopIds) ? [...payload.stopIds] : [],
+    perStop: Number(payload?.perStop) || 10,
     createdAt: now,
+    lastRequestedAt: now,
     expiresAt: now + BATCH_FRESH_CACHE_MS,
     staleUntil: now + Math.max(BATCH_FRESH_CACHE_MS, BATCH_STALE_CACHE_MS)
   });
@@ -725,7 +731,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: payload?.ok !== false,
           stopName: payload?.stopName || `Stop ${stopId}`,
-          source: payload?.source || "136213-browser-v2.4-batch",
+          source: payload?.source || "136213-browser-v2.6-batch",
           count: services.length,
           services,
           cache: payload?.cache || null,
@@ -736,7 +742,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: false,
           stopName: `Stop ${stopId}`,
-          source: "136213-browser-v2.4-batch-error",
+          source: "136213-browser-v2.6-batch-error",
           count: 0,
           services: [],
           error: String(error.message || error),
@@ -749,7 +755,7 @@ async function buildStopsBatch(stopIds, perStop) {
   const services = rowsByStop.flatMap(row => row.services || []);
   return {
     ok: true,
-    source: "136213-browser-v2.4-batched-stops",
+    source: "136213-browser-v2.6-batched-stops",
     grouped: true,
     stopIds,
     perStop,
@@ -833,6 +839,41 @@ async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false } 
   }
 }
 
+
+async function refreshRecentlyRequestedGroupedStops() {
+  const now = Date.now();
+  const candidates = [];
+
+  for (const [key, entry] of batchCache.entries()) {
+    if (!entry || !Array.isArray(entry.stopIds) || !entry.stopIds.length) continue;
+    const lastRequestedAt = Number(entry.lastRequestedAt || entry.createdAt || 0);
+    if (!lastRequestedAt || now - lastRequestedAt > BATCH_KEEP_WARM_MS) continue;
+    if (batchInFlight.has(key)) continue;
+
+    // Refresh before the fresh window expires so an active grouped stop continues
+    // returning from cache instead of becoming a cold 20-30 second batch.
+    if (Number(entry.expiresAt || 0) - now > BATCH_REFRESH_INTERVAL_MS) continue;
+    candidates.push({
+      key,
+      stopIds: entry.stopIds,
+      perStop: entry.perStop
+    });
+  }
+
+  await mapLimit(candidates, 1, async candidate => {
+    try {
+      await beginBatchRefresh(
+        candidate.key,
+        candidate.stopIds,
+        candidate.perStop
+      );
+    } catch (error) {
+      stats.batchErrors += 1;
+      console.error("Active grouped-stop refresh failed:", error.message);
+    }
+  });
+}
+
 async function prewarmKnownGroupedStops() {
   const perthBusport = ["27172", "27180", "27184"];
   const elizabethQuay = [
@@ -877,7 +918,7 @@ app.all("/warm-service-packets", async (req, res) => {
   if (!wait) {
     return res.status(202).json({
       ok: true,
-      source: "transperth-browser-v2.5-service-packet-prewarm",
+      source: "transperth-browser-v2.6-service-packet-prewarm",
       queued: true,
       requested: rows.length,
       fleets: rows.map(row => row.fleet),
@@ -890,7 +931,7 @@ app.all("/warm-service-packets", async (req, res) => {
   const results = await Promise.all(jobs);
   return res.json({
     ok: results.some(result => result?.ok),
-    source: "transperth-browser-v2.5-service-packet-prewarm",
+    source: "transperth-browser-v2.6-service-packet-prewarm",
     queued: false,
     requested: rows.length,
     completed: results.filter(result => result?.ok).length,
@@ -907,7 +948,7 @@ app.get("/warm-service-packets/status", (req, res) => {
   pruneServiceWarmRecent();
   return res.json({
     ok: true,
-    source: "transperth-browser-v2.5-service-packet-prewarm-status",
+    source: "transperth-browser-v2.6-service-packet-prewarm-status",
     active: serviceWarmActive,
     pending: serviceWarmPending.length,
     inFlight: serviceWarmInFlight.size,
@@ -993,7 +1034,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v2.4-batched-stops",
+      source: "136213-browser-v2.6-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -1064,11 +1105,16 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v2.5 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v2.6 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
     });
+
+    const groupedRefreshTimer = setInterval(() => {
+      void refreshRecentlyRequestedGroupedStops();
+    }, BATCH_REFRESH_INTERVAL_MS);
+    groupedRefreshTimer.unref?.();
   } catch (error) {
     console.error("Browser startup failed:", error);
     process.exit(1);

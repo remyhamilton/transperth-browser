@@ -31,11 +31,15 @@ services:
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: BATCH_FRESH_CACHE_MS
-        value: "12000"
+        value: "30000"
       - key: BATCH_STALE_CACHE_MS
-        value: "90000"
+        value: "1800000"
       - key: BATCH_CACHE_MAX_ENTRIES
-        value: "40"
+        value: "80"
+      - key: BATCH_KEEP_WARM_MS
+        value: "900000"
+      - key: BATCH_REFRESH_INTERVAL_MS
+        value: "45000"
       - key: WORKER_BASE_URL
         value: "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
       - key: SERVICE_WARM_MAX_FLEETS

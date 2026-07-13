@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "2.5.0",
-  "description": "Pooled Transperth browser plus background bus service-packet prewarming",
+  "version": "2.6.0",
+  "description": "Pooled Transperth browser with persistent warm grouped-stop batch behaviour and service-packet prewarming",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
