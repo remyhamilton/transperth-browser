@@ -13,6 +13,7 @@ const { chromium } = require("playwright");
 
 const app = express();
 app.disable("x-powered-by");
+app.use(express.json({ limit: "64kb" }));
 
 const PORT = positiveInt(process.env.PORT, 3000, 1, 65535);
 const BROWSER_TOKEN = String(process.env.BROWSER_TOKEN || "").trim();
@@ -28,6 +29,14 @@ const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 12000, 1000, 120000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 90000, 5000, 600000);
 const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 40, 4, 250);
+const WORKER_BASE_URL = String(
+  process.env.WORKER_BASE_URL || "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
+).trim().replace(/\/$/, "");
+const SERVICE_WARM_MAX_FLEETS = positiveInt(process.env.SERVICE_WARM_MAX_FLEETS, 12, 1, 24);
+const SERVICE_WARM_CONCURRENCY = positiveInt(process.env.SERVICE_WARM_CONCURRENCY, 2, 1, 4);
+const SERVICE_WARM_TIMEOUT_MS = positiveInt(process.env.SERVICE_WARM_TIMEOUT_MS, 9000, 2000, 20000);
+const SERVICE_WARM_RECENT_MS = positiveInt(process.env.SERVICE_WARM_RECENT_MS, 45000, 5000, 300000);
+const SERVICE_WARM_QUEUE_MAX = positiveInt(process.env.SERVICE_WARM_QUEUE_MAX, 80, 8, 300);
 
 let browser = null;
 let context = null;
@@ -40,6 +49,10 @@ const cache = new Map();
 const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
+const serviceWarmPending = [];
+const serviceWarmInFlight = new Map();
+const serviceWarmRecent = new Map();
+let serviceWarmActive = 0;
 
 const stats = {
   startedAt: new Date().toISOString(),
@@ -56,13 +69,187 @@ const stats = {
   batchStaleHits: 0,
   batchRefreshes: 0,
   batchErrors: 0,
-  prewarmRuns: 0
+  prewarmRuns: 0,
+  serviceWarmRequests: 0,
+  serviceWarmQueued: 0,
+  serviceWarmSkippedRecent: 0,
+  serviceWarmCoalesced: 0,
+  serviceWarmCompleted: 0,
+  serviceWarmFailed: 0
 };
 
 function positiveInt(value, fallback, min, max) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function cleanFleet(value) {
+  const digits = String(value || "").replace(/\D+/g, "");
+  return /^\d{3,5}$/.test(digits) ? digits : "";
+}
+
+function cleanServiceWarmRow(raw) {
+  if (typeof raw === "string" || typeof raw === "number") {
+    const fleet = cleanFleet(raw);
+    return fleet ? { fleet } : null;
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const fleet = cleanFleet(raw.fleet || raw.fleetNumber || raw.vehicle);
+  if (!fleet) return null;
+  const tripId = String(raw.tripId || raw.tripID || raw.matchedTripId || "").trim().slice(0, 100);
+  const stopId = String(raw.stopId || raw.stopID || raw.selectedStopId || "").trim().replace(/[^0-9A-Za-z_.:-]+/g, "").slice(0, 80);
+  return {
+    fleet,
+    ...(tripId ? { tripId } : {}),
+    ...(stopId ? { stopId } : {})
+  };
+}
+
+function serviceWarmRowsFromRequest(req) {
+  const bodyRows = Array.isArray(req.body?.rows)
+    ? req.body.rows
+    : (Array.isArray(req.body?.fleets) ? req.body.fleets : []);
+  const queryRows = String(req.query.fleets || req.query.fleet || "")
+    .split(/[,\s;|]+/)
+    .filter(Boolean);
+  const rows = [...bodyRows, ...queryRows]
+    .map(cleanServiceWarmRow)
+    .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    const key = `${row.fleet}|${row.tripId || "*"}|${row.stopId || "*"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (out.length >= SERVICE_WARM_MAX_FLEETS) break;
+  }
+  return out;
+}
+
+function serviceWarmKey(row) {
+  return `${row.fleet}|${row.tripId || "*"}|${row.stopId || "*"}`;
+}
+
+function pruneServiceWarmRecent(now = Date.now()) {
+  for (const [key, entry] of serviceWarmRecent.entries()) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) serviceWarmRecent.delete(key);
+  }
+}
+
+async function callWorkerServiceWarm(row, reason) {
+  const target = new URL(`${WORKER_BASE_URL}/internal/serviceOpen/prewarmOne`);
+  target.searchParams.set("fleet", row.fleet);
+  if (row.tripId) target.searchParams.set("preferredTripId", row.tripId);
+  if (row.stopId) target.searchParams.set("selectedStopId", row.stopId);
+  target.searchParams.set("reason", String(reason || "render-service-warm-v2.4").slice(0, 100));
+  target.searchParams.set("source", "render-v2.4");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("service-warm-timeout"), SERVICE_WARM_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(target, {
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${BROWSER_TOKEN}`,
+        "Accept": "application/json",
+        "User-Agent": "Hubway-Render-ServiceWarm/2.4"
+      }
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch {}
+    if (!response.ok || payload?.ok === false) {
+      throw new Error(payload?.error || `Worker service warm HTTP ${response.status}`);
+    }
+    return {
+      ok: true,
+      fleet: row.fleet,
+      tripId: row.tripId || null,
+      stopId: row.stopId || null,
+      stored: payload?.stored === true,
+      source: payload?.source || "worker-service-warm",
+      elapsedMs: Date.now() - startedAt
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pumpServiceWarmQueue() {
+  while (serviceWarmActive < SERVICE_WARM_CONCURRENCY && serviceWarmPending.length) {
+    const job = serviceWarmPending.shift();
+    if (!job) break;
+    serviceWarmActive += 1;
+    const key = serviceWarmKey(job.row);
+    const promise = callWorkerServiceWarm(job.row, job.reason)
+      .then(result => {
+        stats.serviceWarmCompleted += 1;
+        serviceWarmRecent.set(key, {
+          result,
+          expiresAt: Date.now() + SERVICE_WARM_RECENT_MS
+        });
+        job.resolve(result);
+      })
+      .catch(error => {
+        stats.serviceWarmFailed += 1;
+        const result = {
+          ok: false,
+          fleet: job.row.fleet,
+          error: String(error.message || error),
+          elapsedMs: Date.now() - job.startedAt
+        };
+        serviceWarmRecent.set(key, {
+          result,
+          expiresAt: Date.now() + Math.min(10000, SERVICE_WARM_RECENT_MS)
+        });
+        job.resolve(result);
+      })
+      .finally(() => {
+        serviceWarmActive = Math.max(0, serviceWarmActive - 1);
+        if (serviceWarmInFlight.get(key) === promise) serviceWarmInFlight.delete(key);
+        pumpServiceWarmQueue();
+      });
+    serviceWarmInFlight.set(key, promise);
+  }
+}
+
+function enqueueServiceWarm(row, reason) {
+  pruneServiceWarmRecent();
+  const key = serviceWarmKey(row);
+  const recent = serviceWarmRecent.get(key);
+  if (recent) {
+    stats.serviceWarmSkippedRecent += 1;
+    return Promise.resolve({
+      ...(recent.result || { ok: true, fleet: row.fleet }),
+      skipped: true,
+      reason: "recently-warmed"
+    });
+  }
+  const existing = serviceWarmInFlight.get(key);
+  if (existing) {
+    stats.serviceWarmCoalesced += 1;
+    return existing;
+  }
+  if (serviceWarmPending.length >= SERVICE_WARM_QUEUE_MAX) {
+    stats.serviceWarmFailed += 1;
+    return Promise.resolve({ ok: false, fleet: row.fleet, error: "service-warm-queue-full" });
+  }
+
+  let resolveJob;
+  const promise = new Promise(resolve => { resolveJob = resolve; });
+  serviceWarmInFlight.set(key, promise);
+  serviceWarmPending.push({
+    row,
+    reason,
+    resolve: resolveJob,
+    startedAt: Date.now()
+  });
+  stats.serviceWarmQueued += 1;
+  pumpServiceWarmQueue();
+  return promise;
 }
 
 function uniqueStopIds(raw, maxStops = BATCH_MAX_STOPS) {
@@ -433,7 +620,7 @@ async function scrapeStop(stopId, limit, options = {}) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v2.3",
+      source: "136213-browser-v2.4",
       count: parsed.services.length,
       services: parsed.services,
       fetchedAt: new Date().toISOString(),
@@ -522,7 +709,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: payload?.ok !== false,
           stopName: payload?.stopName || `Stop ${stopId}`,
-          source: payload?.source || "136213-browser-v2.3-batch",
+          source: payload?.source || "136213-browser-v2.4-batch",
           count: services.length,
           services,
           cache: payload?.cache || null,
@@ -533,7 +720,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: false,
           stopName: `Stop ${stopId}`,
-          source: "136213-browser-v2.3-batch-error",
+          source: "136213-browser-v2.4-batch-error",
           count: 0,
           services: [],
           error: String(error.message || error),
@@ -546,7 +733,7 @@ async function buildStopsBatch(stopIds, perStop) {
   const services = rowsByStop.flatMap(row => row.services || []);
   return {
     ok: true,
-    source: "136213-browser-v2.3-batched-stops",
+    source: "136213-browser-v2.4-batched-stops",
     grouped: true,
     stopIds,
     perStop,
@@ -650,10 +837,74 @@ async function prewarmKnownGroupedStops() {
   }
 }
 
+
+app.all("/warm-service-packets", async (req, res) => {
+  stats.requests += 1;
+  stats.serviceWarmRequests += 1;
+  if (!authOk(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const rows = serviceWarmRowsFromRequest(req);
+  if (!rows.length) {
+    return res.status(400).json({
+      ok: false,
+      error: "Provide fleets or rows with 3-5 digit fleet numbers"
+    });
+  }
+
+  const reason = String(req.body?.reason || req.query.reason || "worker-request-v2.4").slice(0, 100);
+  const wait = String(req.query.wait || req.body?.wait || "0") === "1";
+  const jobs = rows.map(row => enqueueServiceWarm(row, reason));
+  res.set("Cache-Control", "no-store");
+
+  if (!wait) {
+    return res.status(202).json({
+      ok: true,
+      source: "transperth-browser-v2.4-service-packet-prewarm",
+      queued: true,
+      requested: rows.length,
+      fleets: rows.map(row => row.fleet),
+      active: serviceWarmActive,
+      pending: serviceWarmPending.length,
+      fetchedAt: new Date().toISOString()
+    });
+  }
+
+  const results = await Promise.all(jobs);
+  return res.json({
+    ok: results.some(result => result?.ok),
+    source: "transperth-browser-v2.4-service-packet-prewarm",
+    queued: false,
+    requested: rows.length,
+    completed: results.filter(result => result?.ok).length,
+    failed: results.filter(result => !result?.ok).length,
+    results,
+    fetchedAt: new Date().toISOString()
+  });
+});
+
+app.get("/warm-service-packets/status", (req, res) => {
+  if (!authOk(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  pruneServiceWarmRecent();
+  return res.json({
+    ok: true,
+    source: "transperth-browser-v2.4-service-packet-prewarm-status",
+    active: serviceWarmActive,
+    pending: serviceWarmPending.length,
+    inFlight: serviceWarmInFlight.size,
+    recent: serviceWarmRecent.size,
+    stats,
+    fetchedAt: new Date().toISOString()
+  });
+});
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v2.3",
+    service: "transperth-browser-v2.4",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -662,11 +913,17 @@ app.get("/", (req, res) => {
     inFlight: inFlight.size,
     batchCacheEntries: batchCache.size,
     batchInFlight: batchInFlight.size,
+    serviceWarmActive,
+    serviceWarmPending: serviceWarmPending.length,
+    serviceWarmInFlight: serviceWarmInFlight.size,
+    serviceWarmRecent: serviceWarmRecent.size,
     stats,
     endpoints: [
       "/health",
       "/live-stop/26768?limit=5",
-      "/live-stops?stops=27172,27180,27184&perStop=10"
+      "/live-stops?stops=27172,27180,27184&perStop=10",
+      "/warm-service-packets",
+      "/warm-service-packets/status"
     ]
   });
 });
@@ -720,7 +977,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v2.3-batched-stops",
+      source: "136213-browser-v2.4-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -791,7 +1048,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v2.3 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v2.4 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");

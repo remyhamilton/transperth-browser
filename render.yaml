@@ -36,4 +36,16 @@ services:
         value: "90000"
       - key: BATCH_CACHE_MAX_ENTRIES
         value: "40"
+      - key: WORKER_BASE_URL
+        value: "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
+      - key: SERVICE_WARM_MAX_FLEETS
+        value: "12"
+      - key: SERVICE_WARM_CONCURRENCY
+        value: "2"
+      - key: SERVICE_WARM_TIMEOUT_MS
+        value: "9000"
+      - key: SERVICE_WARM_RECENT_MS
+        value: "45000"
+      - key: SERVICE_WARM_QUEUE_MAX
+        value: "80"
 

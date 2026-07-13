@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "2.3.0",
-  "description": "Pooled browser service for reading Transperth mobi live stop data",
+  "version": "2.4.0",
+  "description": "Pooled Transperth browser plus background bus service-packet prewarming",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
