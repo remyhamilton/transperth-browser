@@ -26,4 +26,14 @@ services:
         value: "45000"
       - key: MAX_CACHE_ENTRIES
         value: "250"
+      - key: BATCH_MAX_STOPS
+        value: "60"
+      - key: BATCH_ROW_WAIT_TIMEOUT_MS
+        value: "900"
+      - key: BATCH_FRESH_CACHE_MS
+        value: "12000"
+      - key: BATCH_STALE_CACHE_MS
+        value: "90000"
+      - key: BATCH_CACHE_MAX_ENTRIES
+        value: "40"
 

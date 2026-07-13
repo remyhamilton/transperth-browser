@@ -1,6 +1,6 @@
 {
   "name": "transperth-browser",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Pooled browser service for reading Transperth mobi live stop data",
   "main": "server.js",
   "scripts": {
