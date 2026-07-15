@@ -1,10 +1,10 @@
 {
   "name": "transperth-browser",
-  "version": "2.6.0",
-  "description": "Pooled Transperth browser with persistent warm grouped-stop batch behaviour and service-packet prewarming",
+  "version": "2.8.0",
+  "description": "Fresh-live-only, memory-bounded pooled Transperth browser with safe grouped-stop batching and service-packet prewarming",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --expose-gc server.js",
     "check": "node --check server.js"
   },
   "keywords": [],
@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "express": "^5.2.1",
-    "playwright": "^1.60.0"
+    "playwright": "1.61.1"
   }
 }
-
