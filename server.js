@@ -20,6 +20,9 @@ const BROWSER_TOKEN = String(process.env.BROWSER_TOKEN || "").trim();
 const POOL_SIZE = positiveInt(process.env.BROWSER_POOL_SIZE, 2, 1, 4);
 const NAVIGATION_TIMEOUT_MS = positiveInt(process.env.NAVIGATION_TIMEOUT_MS, 12000, 3000, 30000);
 const ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.ROW_WAIT_TIMEOUT_MS, 6500, 1000, 15000);
+const LIVE_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.LIVE_ROW_WAIT_TIMEOUT_MS, 1800, 250, 6000);
+const LIVE_SETTLE_MS = positiveInt(process.env.LIVE_SETTLE_MS, 80, 0, 500);
+const BLOCK_STYLESHEETS = String(process.env.BLOCK_STYLESHEETS || "1") !== "0";
 const QUEUE_TIMEOUT_MS = positiveInt(process.env.QUEUE_TIMEOUT_MS, 7000, 500, 20000);
 const FRESH_CACHE_MS = positiveInt(process.env.FRESH_CACHE_MS, 8000, 0, 60000);
 const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000);
@@ -29,8 +32,14 @@ const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
 const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 80, 4, 250);
-const BATCH_KEEP_WARM_MS = positiveInt(process.env.BATCH_KEEP_WARM_MS, 900000, 60000, 3600000);
+const BATCH_KEEP_WARM_MS = positiveInt(process.env.BATCH_KEEP_WARM_MS, 300000, 60000, 3600000);
 const BATCH_REFRESH_INTERVAL_MS = positiveInt(process.env.BATCH_REFRESH_INTERVAL_MS, 45000, 10000, 300000);
+const BATCH_REFRESH_LEAD_MS = positiveInt(process.env.BATCH_REFRESH_LEAD_MS, 15000, 1000, 120000);
+const BATCH_REFRESH_MAX_PER_TICK = positiveInt(process.env.BATCH_REFRESH_MAX_PER_TICK, 2, 1, 12);
+const PAGE_MAX_USES = positiveInt(process.env.PAGE_MAX_USES, 80, 10, 500);
+const MEMORY_CHECK_INTERVAL_MS = positiveInt(process.env.MEMORY_CHECK_INTERVAL_MS, 60000, 15000, 300000);
+const HEAP_SOFT_LIMIT_MB = positiveInt(process.env.HEAP_SOFT_LIMIT_MB, 650, 128, 4096);
+const SERVICE_WARM_RECENT_MAX_ENTRIES = positiveInt(process.env.SERVICE_WARM_RECENT_MAX_ENTRIES, 256, 16, 2000);
 const WORKER_BASE_URL = String(
   process.env.WORKER_BASE_URL || "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
 ).trim().replace(/\/$/, "");
@@ -49,6 +58,10 @@ let browser = null;
 let context = null;
 let shuttingDown = false;
 let startPromise = null;
+let groupedRefreshPromise = null;
+let browserRecyclePromise = null;
+let browserRecycleRequested = false;
+let activeBrowserJobs = 0;
 
 const availablePages = [];
 const waiters = [];
@@ -59,7 +72,11 @@ const batchInFlight = new Map();
 const serviceWarmPending = [];
 const serviceWarmInFlight = new Map();
 const serviceWarmRecent = new Map();
+const managedPages = new Set();
+const pageUseCount = new WeakMap();
+const replacingPages = new WeakSet();
 let serviceWarmActive = 0;
+let lastMemorySnapshot = null;
 
 const stats = {
   startedAt: new Date().toISOString(),
@@ -82,7 +99,15 @@ const stats = {
   serviceWarmSkippedRecent: 0,
   serviceWarmCoalesced: 0,
   serviceWarmCompleted: 0,
-  serviceWarmFailed: 0
+  serviceWarmFailed: 0,
+  groupedRefreshSkippedOverlap: 0,
+  groupedRefreshCandidates: 0,
+  pageRecycles: 0,
+  memoryWarnings: 0,
+  memoryRecycles: 0,
+  strictFreshRequests: 0,
+  strictFreshBatchRequests: 0,
+  liveOnlyRowsDropped: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -143,6 +168,11 @@ function pruneServiceWarmRecent(now = Date.now()) {
   for (const [key, entry] of serviceWarmRecent.entries()) {
     if (!entry || Number(entry.expiresAt || 0) <= now) serviceWarmRecent.delete(key);
   }
+  while (serviceWarmRecent.size > SERVICE_WARM_RECENT_MAX_ENTRIES) {
+    const oldest = serviceWarmRecent.keys().next().value;
+    if (oldest == null) break;
+    serviceWarmRecent.delete(oldest);
+  }
 }
 
 async function callWorkerServiceWarm(row, reason) {
@@ -150,8 +180,8 @@ async function callWorkerServiceWarm(row, reason) {
   target.searchParams.set("fleet", row.fleet);
   if (row.tripId) target.searchParams.set("preferredTripId", row.tripId);
   if (row.stopId) target.searchParams.set("selectedStopId", row.stopId);
-  target.searchParams.set("reason", String(reason || "render-service-warm-v2.5").slice(0, 100));
-  target.searchParams.set("source", "render-v2.4");
+  target.searchParams.set("reason", String(reason || "render-service-warm-v2.7").slice(0, 100));
+  target.searchParams.set("source", "render-v2.7");
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("service-warm-timeout"), SERVICE_WARM_TIMEOUT_MS);
@@ -162,7 +192,7 @@ async function callWorkerServiceWarm(row, reason) {
       headers: {
         "Authorization": `Bearer ${BROWSER_TOKEN}`,
         "Accept": "application/json",
-        "User-Agent": "Hubway-Render-ServiceWarm/2.5"
+        "User-Agent": "Hubway-Render-ServiceWarm/2.7"
       }
     });
     const text = await response.text();
@@ -335,14 +365,19 @@ function getBatchCache(key, allowStale = false) {
   };
 }
 
-function setBatchCache(key, payload) {
+function setBatchCache(key, payload, { markRequested = false } = {}) {
   const now = Date.now();
+  const previous = batchCache.get(key);
+  const previousRequestedAt = Number(previous?.lastRequestedAt || 0);
   batchCache.set(key, {
     payload: structuredCloneSafe(payload),
     stopIds: Array.isArray(payload?.stopIds) ? [...payload.stopIds] : [],
     perStop: Number(payload?.perStop) || 10,
     createdAt: now,
-    lastRequestedAt: now,
+    // Critical v2.7 fix: a background refresh must never pretend that a user
+    // requested this grouped stop. In v2.6 that made every warmed group immortal
+    // and caused it to be scraped again every refresh tick forever.
+    lastRequestedAt: markRequested ? now : previousRequestedAt,
     expiresAt: now + BATCH_FRESH_CACHE_MS,
     staleUntil: now + Math.max(BATCH_FRESH_CACHE_MS, BATCH_STALE_CACHE_MS)
   });
@@ -373,8 +408,8 @@ function stopUrl(stopId) {
   return `https://136213.mobi/RealTime/RealTimeStopResults.aspx?SN=${encodeURIComponent(stopId)}`;
 }
 
-function cacheKey(stopId, limit) {
-  return `${stopId}|${limit}`;
+function cacheKey(stopId, limit, liveOnly = false) {
+  return `${stopId}|${limit}|${liveOnly ? "live" : "mixed"}`;
 }
 
 function pruneCache(now = Date.now()) {
@@ -425,18 +460,23 @@ function structuredCloneSafe(value) {
 }
 
 async function configurePage(page) {
+  managedPages.add(page);
+  pageUseCount.set(page, 0);
+  page.once("close", () => {
+    managedPages.delete(page);
+  });
   page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
   page.setDefaultTimeout(ROW_WAIT_TIMEOUT_MS);
   await page.route("**/*", async route => {
     const type = route.request().resourceType();
-    if (["image", "font", "media"].includes(type)) {
+    if (["image", "font", "media"].includes(type) || (BLOCK_STYLESHEETS && type === "stylesheet")) {
       await route.abort().catch(() => null);
       return;
     }
     await route.continue().catch(() => null);
   });
   page.on("crash", () => {
-    void replaceDeadPage(page);
+    void replaceDeadPage(page, "page-crash");
   });
   return page;
 }
@@ -472,10 +512,12 @@ async function ensureBrowser() {
       browser = null;
       context = null;
       availablePages.splice(0, availablePages.length);
+      managedPages.clear();
       rejectAllWaiters(new Error("Browser disconnected"));
     });
     context = await browser.newContext(browserOptions());
     availablePages.splice(0, availablePages.length);
+    managedPages.clear();
     for (let index = 0; index < POOL_SIZE; index += 1) {
       availablePages.push(await configurePage(await context.newPage()));
     }
@@ -502,21 +544,35 @@ async function closeBrowser() {
   rejectAllWaiters(new Error("Browser closing"));
   if (context) await context.close().catch(() => null);
   if (browser) await browser.close().catch(() => null);
+  managedPages.clear();
   context = null;
   browser = null;
 }
 
-async function replaceDeadPage(deadPage) {
+async function replaceDeadPage(deadPage, reason = "dead") {
+  if (!deadPage || replacingPages.has(deadPage)) return;
+  replacingPages.add(deadPage);
   const index = availablePages.indexOf(deadPage);
   if (index >= 0) availablePages.splice(index, 1);
+  managedPages.delete(deadPage);
   await deadPage.close().catch(() => null);
-  if (shuttingDown) return;
+  if (shuttingDown) {
+    replacingPages.delete(deadPage);
+    return;
+  }
   try {
     await ensureBrowser();
-    const replacement = await configurePage(await context.newPage());
-    releasePage(replacement);
+    // A browser disconnect can rebuild the whole pool while this replacement is
+    // awaiting. Only add a page if the pool is still below its target size.
+    if (context && browser?.isConnected() && managedPages.size < POOL_SIZE) {
+      const replacement = await configurePage(await context.newPage());
+      releasePage(replacement);
+      stats.pageRecycles += 1;
+    }
   } catch (error) {
-    console.error("Failed to replace browser page:", error.message);
+    console.error(`Failed to replace browser page (${reason}):`, error.message);
+  } finally {
+    replacingPages.delete(deadPage);
   }
 }
 
@@ -538,7 +594,7 @@ async function acquirePage() {
 }
 
 function releasePage(page) {
-  if (!page || page.isClosed() || shuttingDown) return;
+  if (!page || page.isClosed() || shuttingDown || !managedPages.has(page)) return;
   const waiter = waiters.shift();
   if (waiter) {
     clearTimeout(waiter.timer);
@@ -551,7 +607,10 @@ function releasePage(page) {
 async function scrapeStop(stopId, limit, options = {}) {
   const page = await acquirePage();
   const startedAt = Date.now();
+  activeBrowserJobs += 1;
   stats.browserFetches += 1;
+
+  const liveOnly = options.liveOnly === true;
 
   try {
     await page.goto(stopUrl(stopId), {
@@ -561,7 +620,7 @@ async function scrapeStop(stopId, limit, options = {}) {
 
     const rowWaitMs = positiveInt(
       options.rowWaitMs,
-      ROW_WAIT_TIMEOUT_MS,
+      liveOnly ? LIVE_ROW_WAIT_TIMEOUT_MS : ROW_WAIT_TIMEOUT_MS,
       250,
       ROW_WAIT_TIMEOUT_MS
     );
@@ -572,8 +631,11 @@ async function scrapeStop(stopId, limit, options = {}) {
         timeout: rowWaitMs
       }).catch(() => null);
     }
+    if (LIVE_SETTLE_MS > 0) {
+      await page.waitForTimeout(LIVE_SETTLE_MS).catch(() => null);
+    }
 
-    const parsed = await page.evaluate(limitValue => {
+    const parsed = await page.evaluate(({ limitValue, liveOnlyValue, stopIdValue }) => {
       const rows = Array.from(document.querySelectorAll(".tpm_row_timetable"));
       const headingCandidates = [
         document.querySelector("h1"),
@@ -585,132 +647,245 @@ async function scrapeStop(stopId, limit, options = {}) {
         .map(node => node?.textContent?.replace(/\s+/g, " ").trim())
         .find(Boolean) || null;
 
-      const services = rows
+      const clean = value => String(value || "").replace(/\s+/g, " ").trim();
+      const absolute = href => {
+        if (!href) return null;
+        try { return new URL(href, location.href).toString(); } catch { return null; }
+      };
+      const queryValue = (href, names) => {
+        if (!href) return null;
+        try {
+          const u = new URL(href, location.href);
+          for (const name of names) {
+            const value = u.searchParams.get(name);
+            if (value) return clean(value);
+          }
+        } catch {}
+        return null;
+      };
+
+      const allServices = rows
         .map(row => {
-          const text = (row.innerText || row.textContent || "")
-            .replace(/\s+/g, " ")
-            .trim();
+          const text = clean(row.innerText || row.textContent || "");
           if (!text) return null;
 
-          const route = text.match(/\b([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT)\b/)?.[1] || null;
+          const links = Array.from(row.querySelectorAll("a[href]"));
+          const detailHref = links
+            .map(link => link.getAttribute("href"))
+            .find(href => /RealTimeFleetTrip|fleet=/i.test(href || "")) || null;
+          const detailURL = absolute(detailHref);
+          const route =
+            clean(row.getAttribute("data-route")) ||
+            text.match(/\b([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT|Airport Line|Armadale Line|Ellenbrook Line|Fremantle Line|Mandurah Line|Midland Line|Thornlie-Cockburn Line|Yanchep Line)\b/i)?.[1] ||
+            null;
           const destination =
-            row.querySelector(".route-display-name strong")?.innerText?.trim() ||
-            text.match(/To\s+.+?(?=\s+Depart from stop|\s+\d+\s*MIN|\s+\(sched)/i)?.[0]?.trim() ||
+            clean(row.querySelector(".route-display-name strong")?.innerText) ||
+            clean(row.getAttribute("data-destination")) ||
+            text.match(/To\s+.+?(?=\s+Depart from stop|\s+\d+\s*MIN|\s+\(sched|$)/i)?.[0]?.trim() ||
             null;
           const stopText =
             Array.from(row.querySelectorAll(".route-display-name"))
-              .map(el => el.innerText.trim())
+              .map(el => clean(el.innerText))
               .find(value => value.toLowerCase().includes("depart from stop")) ||
             "Depart from stop";
-          const tripId = row.getAttribute("data-tripid") || null;
-          const fleet = row.getAttribute("data-fleet") || null;
-          const isLive =
+
+          const fleet =
+            clean(row.getAttribute("data-fleet")) ||
+            clean(row.dataset?.fleet) ||
+            queryValue(detailHref, ["fleet", "fleetNumber", "vehicle"]) ||
+            text.match(/\bFleet\s*#?\s*(\d{3,5})\b/i)?.[1] ||
+            null;
+          const tripId =
+            clean(row.getAttribute("data-tripid")) ||
+            clean(row.dataset?.tripid) ||
+            clean(row.dataset?.tripId) ||
+            queryValue(detailHref, ["tripId", "tripID", "trip", "t"]) ||
+            null;
+          const runNumber =
+            clean(row.getAttribute("data-run")) ||
+            clean(row.dataset?.run) ||
+            text.match(/\b(?:Run|Service)\s*#?\s*([A-Z0-9-]{2,12})\b/i)?.[1] ||
+            null;
+          const platform =
+            clean(row.getAttribute("data-platform")) ||
+            text.match(/\bPlatform\s*([0-9]+[A-Z]?)\b/i)?.[1] ||
+            null;
+
+          const scheduled = /\(sched\.?\)|\bscheduled\b/i.test(text);
+          const isLive = !scheduled && (
             row.classList.contains("fleet-running") ||
+            row.classList.contains("live") ||
             Boolean(fleet) ||
-            /\bLIVE\b/i.test(text);
+            /\bLIVE\b|\barriving\b|\bdeparting\b/i.test(text)
+          );
           const due =
             text.match(/\b\d+\s*MIN\b/i)?.[0]?.replace(/\s+/g, " ").toUpperCase() ||
             (/\barriving\b/i.test(text) ? "Arriving" : null);
-          const scheduled = /\(sched\.\)/i.test(text);
-          const time = text.match(/\b\d{1,2}:\d{2}\s*(am|pm)\b/i)?.[0]?.replace(/\s+/g, "") || null;
+          const dueMinutesMatch = due?.match(/\d+/);
+          const minutesUntilDeparture = dueMinutesMatch
+            ? Number(dueMinutesMatch[0])
+            : (due === "Arriving" ? 0 : null);
+          const time = text.match(/\b\d{1,2}[:.]\d{2}\s*(?:am|pm)\b/i)?.[0]?.replace(/\s+/g, "") || null;
 
           return {
-            route,
-            destination,
+            route: route ? clean(route) : null,
+            destination: destination ? clean(destination) : null,
             stopText,
+            stopId: String(stopIdValue),
             due,
+            dueText: due,
+            minutesUntilDeparture,
             time,
+            departureTime: time,
+            liveTime: isLive ? time : null,
             statusText: isLive ? "Live" : "Scheduled",
             scheduled,
             live: isLive,
+            workerLive: isLive,
+            workerMobiBoardRow: true,
+            workerMobiLiveRow: isLive,
+            workerMobiScheduledRow: !isLive,
             fleetNumber: fleet,
             fleet,
             tripId,
-            detailURL: fleet
+            runNumber,
+            platform,
+            detailURL: detailURL || (fleet
               ? `https://136213.mobi/RealTime/RealTimeFleetTrip.aspx?nq=true&fleet=${encodeURIComponent(fleet)}`
-              : null,
-            rawText: text
+              : null),
+            rawText: text.slice(0, 420)
           };
         })
-        .filter(service => service && service.route && service.destination)
-        .slice(0, limitValue);
+        .filter(service => service && service.route && service.destination);
 
-      return { stopName, services };
-    }, limit);
+      const services = (liveOnlyValue
+        ? allServices.filter(service => service.live === true)
+        : allServices
+      ).slice(0, limitValue);
 
+      return {
+        stopName,
+        services,
+        rawRowCount: allServices.length,
+        liveRowCount: allServices.filter(service => service.live === true).length
+      };
+    }, { limitValue: limit, liveOnlyValue: liveOnly, stopIdValue: stopId });
+
+    stats.liveOnlyRowsDropped += liveOnly
+      ? Math.max(0, Number(parsed.rawRowCount || 0) - Number(parsed.liveRowCount || 0))
+      : 0;
+
+    const fetchedAt = new Date().toISOString();
     return {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v2.4",
+      source: "136213-browser-v2.8-fresh-live-board",
+      freshLive: options.forceRefresh === true,
+      liveOnly,
+      rawRowCount: parsed.rawRowCount,
+      liveRowCount: parsed.liveRowCount,
       count: parsed.services.length,
-      services: parsed.services,
-      fetchedAt: new Date().toISOString(),
+      services: parsed.services.map(service => ({
+        ...service,
+        observedAt: fetchedAt,
+        liveFetchedAt: fetchedAt
+      })),
+      fetchedAt,
       timings: {
-        browserMs: Date.now() - startedAt
+        browserMs: Date.now() - startedAt,
+        rowWaitMs
       }
     };
   } finally {
     try {
-      await page.evaluate(() => {
-        window.stop?.();
-        localStorage.clear();
-        sessionStorage.clear();
-      });
+      // Preserve cookies/session storage between requests. That is the warm-session
+      // speed advantage of this service. Only halt stray network activity.
+      await page.evaluate(() => window.stop?.());
     } catch (_) {}
-    releasePage(page);
+
+    activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+    const uses = Number(pageUseCount.get(page) || 0) + 1;
+    pageUseCount.set(page, uses);
+    if (page.isClosed()) {
+      void replaceDeadPage(page, "closed-after-scrape");
+    } else if (uses >= PAGE_MAX_USES) {
+      void replaceDeadPage(page, "scheduled-page-recycle");
+    } else {
+      releasePage(page);
+    }
+
+    if (browserRecycleRequested && activeBrowserJobs === 0 && waiters.length === 0) {
+      void recycleBrowserForMemory("deferred-after-request");
+    }
   }
 }
 
 async function fetchStopShared(stopId, limit, options = {}) {
-  const key = cacheKey(stopId, limit);
-  const fresh = getCache(key, false);
-  if (fresh) {
-    stats.cacheHits += 1;
-    return {
-      ...fresh.payload,
-      cache: { hit: true, stale: false, ageMs: fresh.ageMs }
-    };
+  const liveOnly = options.liveOnly === true;
+  const forceRefresh = options.forceRefresh === true;
+  const allowStale = options.allowStale !== false && !forceRefresh;
+  const cacheResult = options.cacheResult !== false && !forceRefresh;
+  const key = cacheKey(stopId, limit, liveOnly);
+  const inFlightKey = `${forceRefresh ? "fresh" : "normal"}|${key}`;
+
+  if (!forceRefresh) {
+    const fresh = getCache(key, false);
+    if (fresh) {
+      stats.cacheHits += 1;
+      return {
+        ...fresh.payload,
+        cache: { hit: true, stale: false, ageMs: fresh.ageMs }
+      };
+    }
+  } else {
+    stats.strictFreshRequests += 1;
   }
 
-  const existing = inFlight.get(key);
+  const existing = inFlight.get(inFlightKey);
   if (existing) {
     stats.coalesced += 1;
     const payload = await existing;
-    return { ...payload, cache: { hit: false, coalesced: true } };
+    return { ...payload, cache: { hit: false, coalesced: true, strictFresh: forceRefresh } };
   }
 
   const promise = (async () => {
     try {
-      const payload = await scrapeStop(stopId, limit, options);
-      setCache(key, payload);
+      const payload = await scrapeStop(stopId, limit, {
+        ...options,
+        liveOnly,
+        forceRefresh
+      });
+      if (cacheResult) setCache(key, payload);
       return payload;
     } catch (error) {
       stats.browserErrors += 1;
-      const stale = getCache(key, true);
-      if (stale) {
-        stats.staleRescues += 1;
-        return {
-          ...stale.payload,
-          degraded: true,
-          cache: { hit: true, stale: true, ageMs: stale.ageMs },
-          warning: String(error.message || error)
-        };
+      if (allowStale) {
+        const stale = getCache(key, true);
+        if (stale) {
+          stats.staleRescues += 1;
+          return {
+            ...stale.payload,
+            degraded: true,
+            cache: { hit: true, stale: true, ageMs: stale.ageMs },
+            warning: String(error.message || error)
+          };
+        }
       }
       throw error;
     }
   })();
 
-  inFlight.set(key, promise);
+  inFlight.set(inFlightKey, promise);
   try {
     return await promise;
   } finally {
-    if (inFlight.get(key) === promise) inFlight.delete(key);
+    if (inFlight.get(inFlightKey) === promise) inFlight.delete(inFlightKey);
   }
 }
 
 
-async function buildStopsBatch(stopIds, perStop) {
+async function buildStopsBatch(stopIds, perStop, options = {}) {
   const startedAt = Date.now();
   stats.batchRefreshes += 1;
 
@@ -721,7 +896,13 @@ async function buildStopsBatch(stopIds, perStop) {
       const stopStartedAt = Date.now();
       try {
         const payload = await fetchStopShared(stopId, perStop, {
-          rowWaitMs: BATCH_ROW_WAIT_TIMEOUT_MS
+          rowWaitMs: options.liveOnly
+            ? Math.min(LIVE_ROW_WAIT_TIMEOUT_MS, BATCH_ROW_WAIT_TIMEOUT_MS)
+            : BATCH_ROW_WAIT_TIMEOUT_MS,
+          forceRefresh: options.forceRefresh === true,
+          allowStale: options.allowStale !== false,
+          cacheResult: options.cacheResult !== false,
+          liveOnly: options.liveOnly === true
         });
         const services = (Array.isArray(payload?.services) ? payload.services : [])
           .slice(0, perStop)
@@ -731,7 +912,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: payload?.ok !== false,
           stopName: payload?.stopName || `Stop ${stopId}`,
-          source: payload?.source || "136213-browser-v2.6-batch",
+          source: payload?.source || "136213-browser-v2.7-batch",
           count: services.length,
           services,
           cache: payload?.cache || null,
@@ -742,7 +923,7 @@ async function buildStopsBatch(stopIds, perStop) {
           stopId,
           ok: false,
           stopName: `Stop ${stopId}`,
-          source: "136213-browser-v2.6-batch-error",
+          source: "136213-browser-v2.8-batch-error",
           count: 0,
           services: [],
           error: String(error.message || error),
@@ -755,7 +936,7 @@ async function buildStopsBatch(stopIds, perStop) {
   const services = rowsByStop.flatMap(row => row.services || []);
   return {
     ok: true,
-    source: "136213-browser-v2.6-batched-stops",
+    source: "136213-browser-v2.8-batched-stops",
     grouped: true,
     stopIds,
     perStop,
@@ -770,13 +951,13 @@ async function buildStopsBatch(stopIds, perStop) {
   };
 }
 
-function beginBatchRefresh(key, stopIds, perStop) {
+function beginBatchRefresh(key, stopIds, perStop, { markRequested = false, buildOptions = {} } = {}) {
   const existing = batchInFlight.get(key);
   if (existing) return existing;
 
-  const promise = buildStopsBatch(stopIds, perStop)
+  const promise = buildStopsBatch(stopIds, perStop, buildOptions)
     .then(payload => {
-      setBatchCache(key, payload);
+      setBatchCache(key, payload, { markRequested });
       return payload;
     })
     .finally(() => {
@@ -787,8 +968,25 @@ function beginBatchRefresh(key, stopIds, perStop) {
   return promise;
 }
 
-async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false } = {}) {
+async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false, liveOnly = false, allowStale = true } = {}) {
   const key = batchCacheKey(stopIds, perStop);
+
+  if (forceRefresh) {
+    stats.strictFreshBatchRequests += 1;
+    const strictKey = `fresh|${key}|${liveOnly ? "live" : "mixed"}`;
+    const existingStrict = batchInFlight.get(strictKey);
+    if (existingStrict) return existingStrict;
+    const strictPromise = buildStopsBatch(stopIds, perStop, {
+      forceRefresh: true,
+      liveOnly,
+      allowStale: false,
+      cacheResult: false
+    }).finally(() => {
+      if (batchInFlight.get(strictKey) === strictPromise) batchInFlight.delete(strictKey);
+    });
+    batchInFlight.set(strictKey, strictPromise);
+    return strictPromise;
+  }
 
   if (!forceRefresh) {
     const fresh = getBatchCache(key, false);
@@ -823,7 +1021,7 @@ async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false } 
   if (existing) return existing;
 
   try {
-    return await beginBatchRefresh(key, stopIds, perStop);
+    return await beginBatchRefresh(key, stopIds, perStop, { markRequested: true });
   } catch (error) {
     stats.batchErrors += 1;
     const stale = getBatchCache(key, true);
@@ -841,37 +1039,53 @@ async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false } 
 
 
 async function refreshRecentlyRequestedGroupedStops() {
-  const now = Date.now();
-  const candidates = [];
-
-  for (const [key, entry] of batchCache.entries()) {
-    if (!entry || !Array.isArray(entry.stopIds) || !entry.stopIds.length) continue;
-    const lastRequestedAt = Number(entry.lastRequestedAt || entry.createdAt || 0);
-    if (!lastRequestedAt || now - lastRequestedAt > BATCH_KEEP_WARM_MS) continue;
-    if (batchInFlight.has(key)) continue;
-
-    // Refresh before the fresh window expires so an active grouped stop continues
-    // returning from cache instead of becoming a cold 20-30 second batch.
-    if (Number(entry.expiresAt || 0) - now > BATCH_REFRESH_INTERVAL_MS) continue;
-    candidates.push({
-      key,
-      stopIds: entry.stopIds,
-      perStop: entry.perStop
-    });
+  if (groupedRefreshPromise) {
+    stats.groupedRefreshSkippedOverlap += 1;
+    return groupedRefreshPromise;
   }
 
-  await mapLimit(candidates, 1, async candidate => {
-    try {
-      await beginBatchRefresh(
-        candidate.key,
-        candidate.stopIds,
-        candidate.perStop
-      );
-    } catch (error) {
-      stats.batchErrors += 1;
-      console.error("Active grouped-stop refresh failed:", error.message);
+  groupedRefreshPromise = (async () => {
+    const now = Date.now();
+    const candidates = [];
+
+    for (const [key, entry] of batchCache.entries()) {
+      if (!entry || !Array.isArray(entry.stopIds) || !entry.stopIds.length) continue;
+      const lastRequestedAt = Number(entry.lastRequestedAt || 0);
+      if (!lastRequestedAt || now - lastRequestedAt > BATCH_KEEP_WARM_MS) continue;
+      if (batchInFlight.has(key)) continue;
+
+      // Only refresh shortly before expiry. v2.6 refreshed every active group on
+      // every timer tick because the fresh TTL was shorter than the timer.
+      if (Number(entry.expiresAt || 0) - now > BATCH_REFRESH_LEAD_MS) continue;
+      candidates.push({
+        key,
+        stopIds: entry.stopIds,
+        perStop: entry.perStop,
+        expiresAt: Number(entry.expiresAt || 0)
+      });
     }
-  });
+
+    candidates.sort((a, b) => a.expiresAt - b.expiresAt);
+    const selected = candidates.slice(0, BATCH_REFRESH_MAX_PER_TICK);
+    stats.groupedRefreshCandidates += selected.length;
+
+    await mapLimit(selected, 1, async candidate => {
+      try {
+        await beginBatchRefresh(candidate.key, candidate.stopIds, candidate.perStop, {
+          markRequested: false
+        });
+      } catch (error) {
+        stats.batchErrors += 1;
+        console.error("Active grouped-stop refresh failed:", error.message);
+      }
+    });
+  })();
+
+  try {
+    return await groupedRefreshPromise;
+  } finally {
+    groupedRefreshPromise = null;
+  }
 }
 
 async function prewarmKnownGroupedStops() {
@@ -895,6 +1109,75 @@ async function prewarmKnownGroupedStops() {
 }
 
 
+function memorySnapshot() {
+  const usage = process.memoryUsage();
+  const toMB = value => Math.round((Number(value || 0) / 1024 / 1024) * 10) / 10;
+  return {
+    rssMB: toMB(usage.rss),
+    heapUsedMB: toMB(usage.heapUsed),
+    heapTotalMB: toMB(usage.heapTotal),
+    externalMB: toMB(usage.external),
+    arrayBuffersMB: toMB(usage.arrayBuffers),
+    cacheEntries: cache.size,
+    batchCacheEntries: batchCache.size,
+    serviceWarmRecent: serviceWarmRecent.size,
+    managedPages: managedPages.size,
+    activeBrowserJobs,
+    at: new Date().toISOString()
+  };
+}
+
+async function recycleBrowserForMemory(reason = "heap-soft-limit") {
+  if (browserRecyclePromise || shuttingDown) return browserRecyclePromise;
+  if (activeBrowserJobs > 0 || waiters.length > 0) {
+    browserRecycleRequested = true;
+    return null;
+  }
+
+  browserRecycleRequested = false;
+  browserRecyclePromise = (async () => {
+    stats.memoryRecycles += 1;
+    console.warn(`Memory recycle started (${reason})`, memorySnapshot());
+
+    // These caches are performance hints only; dropping them is safer than letting
+    // a long-lived Playwright process reach V8's fatal heap limit.
+    cache.clear();
+    batchCache.clear();
+    serviceWarmRecent.clear();
+    pruneServiceWarmRecent();
+
+    await closeBrowser();
+    if (!shuttingDown) await ensureBrowser();
+    if (typeof global.gc === "function") {
+      try { global.gc(); } catch (_) {}
+    }
+    lastMemorySnapshot = memorySnapshot();
+    console.warn(`Memory recycle completed (${reason})`, lastMemorySnapshot);
+  })().catch(error => {
+    console.error("Memory recycle failed:", error);
+  }).finally(() => {
+    browserRecyclePromise = null;
+  });
+
+  return browserRecyclePromise;
+}
+
+function monitorMemory() {
+  pruneCache();
+  pruneBatchCache();
+  pruneServiceWarmRecent();
+  lastMemorySnapshot = memorySnapshot();
+  if (lastMemorySnapshot.heapUsedMB < HEAP_SOFT_LIMIT_MB) return;
+
+  stats.memoryWarnings += 1;
+  console.warn(
+    `Heap soft limit reached: ${lastMemorySnapshot.heapUsedMB} MB >= ${HEAP_SOFT_LIMIT_MB} MB`,
+    lastMemorySnapshot
+  );
+  void recycleBrowserForMemory("heap-soft-limit");
+}
+
+
 app.all("/warm-service-packets", async (req, res) => {
   stats.requests += 1;
   stats.serviceWarmRequests += 1;
@@ -910,7 +1193,7 @@ app.all("/warm-service-packets", async (req, res) => {
     });
   }
 
-  const reason = String(req.body?.reason || req.query.reason || "worker-request-v2.5").slice(0, 100);
+  const reason = String(req.body?.reason || req.query.reason || "worker-request-v2.7").slice(0, 100);
   const wait = String(req.query.wait || req.body?.wait || "0") === "1";
   const jobs = rows.map(row => enqueueServiceWarm(row, reason));
   res.set("Cache-Control", "no-store");
@@ -918,7 +1201,7 @@ app.all("/warm-service-packets", async (req, res) => {
   if (!wait) {
     return res.status(202).json({
       ok: true,
-      source: "transperth-browser-v2.6-service-packet-prewarm",
+      source: "transperth-browser-v2.7-service-packet-prewarm",
       queued: true,
       requested: rows.length,
       fleets: rows.map(row => row.fleet),
@@ -931,7 +1214,7 @@ app.all("/warm-service-packets", async (req, res) => {
   const results = await Promise.all(jobs);
   return res.json({
     ok: results.some(result => result?.ok),
-    source: "transperth-browser-v2.6-service-packet-prewarm",
+    source: "transperth-browser-v2.7-service-packet-prewarm",
     queued: false,
     requested: rows.length,
     completed: results.filter(result => result?.ok).length,
@@ -948,7 +1231,7 @@ app.get("/warm-service-packets/status", (req, res) => {
   pruneServiceWarmRecent();
   return res.json({
     ok: true,
-    source: "transperth-browser-v2.6-service-packet-prewarm-status",
+    source: "transperth-browser-v2.7-service-packet-prewarm-status",
     active: serviceWarmActive,
     pending: serviceWarmPending.length,
     inFlight: serviceWarmInFlight.size,
@@ -961,7 +1244,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v2.5",
+    service: "transperth-browser-v2.8",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -974,6 +1257,7 @@ app.get("/", (req, res) => {
     serviceWarmPending: serviceWarmPending.length,
     serviceWarmInFlight: serviceWarmInFlight.size,
     serviceWarmRecent: serviceWarmRecent.size,
+    memory: lastMemorySnapshot || memorySnapshot(),
     stats,
     endpoints: [
       "/health",
@@ -993,7 +1277,8 @@ app.get("/health", async (req, res) => {
       browserConnected: Boolean(browser?.isConnected()),
       poolSize: POOL_SIZE,
       availablePages: availablePages.length,
-      queuedRequests: waiters.length
+      queuedRequests: waiters.length,
+      memory: lastMemorySnapshot || memorySnapshot()
     });
   } catch (error) {
     res.status(503).json({ ok: false, error: String(error.message || error) });
@@ -1018,11 +1303,16 @@ app.get("/live-stops", async (req, res) => {
   }
 
   const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 10, 1, 24);
-  const forceRefresh = String(req.query.refresh || "") === "1";
+  const forceRefresh = String(req.query.fresh || req.query.refresh || "") === "1";
+  const liveOnly = String(req.query.liveOnly || req.query.live || "") === "1";
   const startedAt = Date.now();
 
   try {
-    const payload = await fetchStopsBatchShared(stopIds, perStop, { forceRefresh });
+    const payload = await fetchStopsBatchShared(stopIds, perStop, {
+      forceRefresh,
+      liveOnly,
+      allowStale: !forceRefresh
+    });
     res.set("Cache-Control", "no-store");
     return res.json({
       ...payload,
@@ -1034,7 +1324,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v2.6-batched-stops",
+      source: "136213-browser-v2.8-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -1054,10 +1344,19 @@ app.get("/live-stop/:stopId", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid stop number" });
   }
   const limit = positiveInt(req.query.limit, 5, 1, 24);
+  const forceRefresh = String(req.query.fresh || req.query.refresh || "") === "1";
+  const liveOnly = String(req.query.liveOnly || req.query.live || "") === "1";
+  const allowStale = !forceRefresh && String(req.query.allowStale || "1") !== "0";
   const startedAt = Date.now();
 
   try {
-    const payload = await fetchStopShared(stopId, limit);
+    const payload = await fetchStopShared(stopId, limit, {
+      forceRefresh,
+      liveOnly,
+      allowStale,
+      cacheResult: !forceRefresh,
+      rowWaitMs: liveOnly ? LIVE_ROW_WAIT_TIMEOUT_MS : undefined
+    });
     res.set("Cache-Control", "no-store");
     return res.json({
       ...payload,
@@ -1105,7 +1404,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v2.6 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v2.8 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
@@ -1115,6 +1414,12 @@ app.listen(PORT, async () => {
       void refreshRecentlyRequestedGroupedStops();
     }, BATCH_REFRESH_INTERVAL_MS);
     groupedRefreshTimer.unref?.();
+
+    const memoryTimer = setInterval(() => {
+      monitorMemory();
+    }, MEMORY_CHECK_INTERVAL_MS);
+    memoryTimer.unref?.();
+    monitorMemory();
   } catch (error) {
     console.error("Browser startup failed:", error);
     process.exit(1);
