@@ -13,33 +13,51 @@ services:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
       - key: BROWSER_POOL_SIZE
-        value: "2"
+        value: "3"
       - key: NAVIGATION_TIMEOUT_MS
         value: "12000"
       - key: ROW_WAIT_TIMEOUT_MS
         value: "6500"
+      - key: LIVE_ROW_WAIT_TIMEOUT_MS
+        value: "1800"
+      - key: LIVE_SETTLE_MS
+        value: "80"
+      - key: BLOCK_STYLESHEETS
+        value: "1"
       - key: QUEUE_TIMEOUT_MS
         value: "7000"
       - key: FRESH_CACHE_MS
-        value: "8000"
+        value: "10000"
       - key: STALE_CACHE_MS
-        value: "45000"
+        value: "60000"
       - key: MAX_CACHE_ENTRIES
-        value: "250"
+        value: "160"
       - key: BATCH_MAX_STOPS
         value: "60"
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: BATCH_FRESH_CACHE_MS
-        value: "30000"
+        value: "90000"
       - key: BATCH_STALE_CACHE_MS
-        value: "1800000"
-      - key: BATCH_CACHE_MAX_ENTRIES
-        value: "80"
-      - key: BATCH_KEEP_WARM_MS
         value: "900000"
+      - key: BATCH_CACHE_MAX_ENTRIES
+        value: "32"
+      - key: BATCH_KEEP_WARM_MS
+        value: "300000"
       - key: BATCH_REFRESH_INTERVAL_MS
         value: "45000"
+      - key: BATCH_REFRESH_LEAD_MS
+        value: "15000"
+      - key: BATCH_REFRESH_MAX_PER_TICK
+        value: "2"
+      - key: PAGE_MAX_USES
+        value: "80"
+      - key: MEMORY_CHECK_INTERVAL_MS
+        value: "60000"
+      - key: HEAP_SOFT_LIMIT_MB
+        value: "650"
+      - key: SERVICE_WARM_RECENT_MAX_ENTRIES
+        value: "256"
       - key: WORKER_BASE_URL
         value: "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
       - key: SERVICE_WARM_MAX_FLEETS
