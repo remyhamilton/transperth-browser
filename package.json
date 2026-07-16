@@ -1,6 +1,6 @@
 {
   "name": "transperth-browser",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "Fresh-live-only, memory-bounded pooled Transperth browser with safe grouped-stop batching and service-packet prewarming",
   "main": "server.js",
   "scripts": {
