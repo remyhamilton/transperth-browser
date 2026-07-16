@@ -69,6 +69,10 @@ const cache = new Map();
 const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
+// v2.9: service rows are never reused for strict-fresh requests. This map stores
+// only which component stop IDs recently produced live rows, so a large grouped
+// stop can scan the most promising stands first without returning stale times.
+const groupedStopHotness = new Map();
 const serviceWarmPending = [];
 const serviceWarmInFlight = new Map();
 const serviceWarmRecent = new Map();
@@ -107,7 +111,9 @@ const stats = {
   memoryRecycles: 0,
   strictFreshRequests: 0,
   strictFreshBatchRequests: 0,
-  liveOnlyRowsDropped: 0
+  liveOnlyRowsDropped: 0,
+  hotFirstBatchReturns: 0,
+  groupedBackgroundCompletions: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -780,7 +786,7 @@ async function scrapeStop(stopId, limit, options = {}) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v2.8-fresh-live-board",
+      source: "136213-browser-v2.9-fresh-live-board",
       freshLive: options.forceRefresh === true,
       liveOnly,
       rawRowCount: parsed.rawRowCount,
@@ -885,63 +891,148 @@ async function fetchStopShared(stopId, limit, options = {}) {
 }
 
 
+function updateGroupedStopHotnessV29(stopId, liveCount) {
+  const key = String(stopId || "").trim();
+  if (!key) return;
+  const now = Date.now();
+  const previous = groupedStopHotness.get(key);
+  groupedStopHotness.set(key, {
+    liveCount: Math.max(0, Number(liveCount) || 0),
+    lastLiveAt: Number(liveCount) > 0 ? now : Number(previous?.lastLiveAt || 0),
+    lastScannedAt: now
+  });
+  while (groupedStopHotness.size > 512) {
+    const oldest = groupedStopHotness.keys().next().value;
+    if (oldest == null) break;
+    groupedStopHotness.delete(oldest);
+  }
+}
+
+function hotFirstGroupedStopIdsV29(stopIds) {
+  return stopIds
+    .map((stopId, index) => ({ stopId, index, hot: groupedStopHotness.get(stopId) || null }))
+    .sort((a, b) => {
+      const liveDiff = Number(b.hot?.liveCount || 0) - Number(a.hot?.liveCount || 0);
+      if (liveDiff) return liveDiff;
+      const seenDiff = Number(b.hot?.lastLiveAt || 0) - Number(a.hot?.lastLiveAt || 0);
+      if (seenDiff) return seenDiff;
+      return a.index - b.index;
+    })
+    .map(row => row.stopId);
+}
+
+async function scanGroupedStopV29(stopId, perStop, options = {}) {
+  const stopStartedAt = Date.now();
+  try {
+    const payload = await fetchStopShared(stopId, perStop, {
+      rowWaitMs: options.liveOnly
+        ? Math.min(LIVE_ROW_WAIT_TIMEOUT_MS, BATCH_ROW_WAIT_TIMEOUT_MS)
+        : BATCH_ROW_WAIT_TIMEOUT_MS,
+      forceRefresh: options.forceRefresh === true,
+      allowStale: options.allowStale !== false,
+      cacheResult: options.cacheResult !== false,
+      liveOnly: options.liveOnly === true
+    });
+    const services = (Array.isArray(payload?.services) ? payload.services : [])
+      .slice(0, perStop)
+      .map(service => ({ ...service, stopId }));
+    updateGroupedStopHotnessV29(stopId, services.filter(row => row?.live === true).length);
+    return {
+      stopId,
+      ok: payload?.ok !== false,
+      stopName: payload?.stopName || `Stop ${stopId}`,
+      source: payload?.source || "136213-browser-v2.9-batch",
+      count: services.length,
+      services,
+      cache: payload?.cache || null,
+      ms: Date.now() - stopStartedAt
+    };
+  } catch (error) {
+    updateGroupedStopHotnessV29(stopId, 0);
+    return {
+      stopId,
+      ok: false,
+      stopName: `Stop ${stopId}`,
+      source: "136213-browser-v2.9-batch-error",
+      count: 0,
+      services: [],
+      error: String(error.message || error),
+      ms: Date.now() - stopStartedAt
+    };
+  }
+}
+
 async function buildStopsBatch(stopIds, perStop, options = {}) {
   const startedAt = Date.now();
   stats.batchRefreshes += 1;
 
-  const rowsByStop = await mapLimit(
-    stopIds,
-    POOL_SIZE,
-    async stopId => {
-      const stopStartedAt = Date.now();
-      try {
-        const payload = await fetchStopShared(stopId, perStop, {
-          rowWaitMs: options.liveOnly
-            ? Math.min(LIVE_ROW_WAIT_TIMEOUT_MS, BATCH_ROW_WAIT_TIMEOUT_MS)
-            : BATCH_ROW_WAIT_TIMEOUT_MS,
-          forceRefresh: options.forceRefresh === true,
-          allowStale: options.allowStale !== false,
-          cacheResult: options.cacheResult !== false,
-          liveOnly: options.liveOnly === true
-        });
-        const services = (Array.isArray(payload?.services) ? payload.services : [])
-          .slice(0, perStop)
-          .map(service => ({ ...service, stopId }));
-
-        return {
-          stopId,
-          ok: payload?.ok !== false,
-          stopName: payload?.stopName || `Stop ${stopId}`,
-          source: payload?.source || "136213-browser-v2.7-batch",
-          count: services.length,
-          services,
-          cache: payload?.cache || null,
-          ms: Date.now() - stopStartedAt
-        };
-      } catch (error) {
-        return {
-          stopId,
-          ok: false,
-          stopName: `Stop ${stopId}`,
-          source: "136213-browser-v2.8-batch-error",
-          count: 0,
-          services: [],
-          error: String(error.message || error),
-          ms: Date.now() - stopStartedAt
-        };
-      }
-    }
+  const orderedStopIds = options.hotFirst === false
+    ? [...stopIds]
+    : hotFirstGroupedStopIdsV29(stopIds);
+  const targetRows = positiveInt(
+    options.targetRows,
+    Math.min(Math.max(perStop, 5), 18),
+    1,
+    100
   );
+  const fastReturnMs = positiveInt(options.fastReturnMs, 3800, 800, 15000);
+  const rowsByStop = [];
+  const pending = [...orderedStopIds];
+
+  while (pending.length) {
+    const wave = pending.splice(0, Math.max(1, POOL_SIZE));
+    const waveRows = await Promise.all(
+      wave.map(stopId => scanGroupedStopV29(stopId, perStop, options))
+    );
+    rowsByStop.push(...waveRows);
+
+    const liveRowsFound = rowsByStop.reduce(
+      (sum, row) => sum + (Array.isArray(row?.services) ? row.services.length : 0),
+      0
+    );
+    const elapsed = Date.now() - startedAt;
+    const canFastReturn = pending.length > 0 && liveRowsFound > 0 && (
+      liveRowsFound >= targetRows || elapsed >= fastReturnMs
+    );
+
+    if (canFastReturn) {
+      stats.hotFirstBatchReturns += 1;
+      if (options.backgroundComplete !== false) {
+        const remaining = [...pending];
+        void mapLimit(remaining, POOL_SIZE, stopId =>
+          scanGroupedStopV29(stopId, perStop, { ...options, cacheResult: false })
+        ).then(() => {
+          stats.groupedBackgroundCompletions += 1;
+        }).catch(error => {
+          stats.batchErrors += 1;
+          console.error("Grouped hot-first background completion failed:", error.message);
+        });
+      }
+      break;
+    }
+  }
 
   const services = rowsByStop.flatMap(row => row.services || []);
+  const scannedStopIds = rowsByStop.map(row => row.stopId);
+  const pendingStopIds = orderedStopIds.filter(stopId => !scannedStopIds.includes(stopId));
+  const complete = pendingStopIds.length === 0;
+
   return {
     ok: true,
-    source: "136213-browser-v2.8-batched-stops",
+    source: "136213-browser-v2.9-hot-first-batched-stops",
     grouped: true,
     stopIds,
+    scannedStopIds,
+    pendingStopIds,
+    groupedScanComplete: complete,
+    livePending: !complete,
+    authoritativeEmptyBoard: complete && services.length === 0,
+    retryAfterMs: complete ? 0 : 900,
     perStop,
+    targetRows,
     count: services.length,
     componentCount: stopIds.length,
+    scannedComponentCount: rowsByStop.length,
     services,
     rowsByStop,
     fetchedAt: new Date().toISOString(),
@@ -968,7 +1059,15 @@ function beginBatchRefresh(key, stopIds, perStop, { markRequested = false, build
   return promise;
 }
 
-async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false, liveOnly = false, allowStale = true } = {}) {
+async function fetchStopsBatchShared(stopIds, perStop, {
+  forceRefresh = false,
+  liveOnly = false,
+  allowStale = true,
+  hotFirst = true,
+  targetRows = null,
+  fastReturnMs = null,
+  backgroundComplete = true
+} = {}) {
   const key = batchCacheKey(stopIds, perStop);
 
   if (forceRefresh) {
@@ -980,7 +1079,11 @@ async function fetchStopsBatchShared(stopIds, perStop, { forceRefresh = false, l
       forceRefresh: true,
       liveOnly,
       allowStale: false,
-      cacheResult: false
+      cacheResult: false,
+      hotFirst,
+      targetRows,
+      fastReturnMs,
+      backgroundComplete
     }).finally(() => {
       if (batchInFlight.get(strictKey) === strictPromise) batchInFlight.delete(strictKey);
     });
@@ -1120,6 +1223,7 @@ function memorySnapshot() {
     arrayBuffersMB: toMB(usage.arrayBuffers),
     cacheEntries: cache.size,
     batchCacheEntries: batchCache.size,
+    groupedStopHotnessEntries: groupedStopHotness.size,
     serviceWarmRecent: serviceWarmRecent.size,
     managedPages: managedPages.size,
     activeBrowserJobs,
@@ -1244,7 +1348,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v2.8",
+    service: "transperth-browser-v2.9",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1305,13 +1409,21 @@ app.get("/live-stops", async (req, res) => {
   const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 10, 1, 24);
   const forceRefresh = String(req.query.fresh || req.query.refresh || "") === "1";
   const liveOnly = String(req.query.liveOnly || req.query.live || "") === "1";
+  const hotFirst = String(req.query.hotFirst || "1") !== "0";
+  const targetRows = positiveInt(req.query.targetRows, Math.min(Math.max(perStop, 5), 18), 1, 100);
+  const fastReturnMs = positiveInt(req.query.fastReturnMs, 3800, 800, 15000);
+  const backgroundComplete = String(req.query.backgroundComplete || "1") !== "0";
   const startedAt = Date.now();
 
   try {
     const payload = await fetchStopsBatchShared(stopIds, perStop, {
       forceRefresh,
       liveOnly,
-      allowStale: !forceRefresh
+      allowStale: !forceRefresh,
+      hotFirst,
+      targetRows,
+      fastReturnMs,
+      backgroundComplete
     });
     res.set("Cache-Control", "no-store");
     return res.json({
@@ -1324,7 +1436,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v2.8-batched-stops",
+      source: "136213-browser-v2.9-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -1404,7 +1516,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v2.8 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v2.9 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
