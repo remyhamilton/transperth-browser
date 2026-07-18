@@ -36,6 +36,14 @@ services:
         value: "60"
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
+      - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
+        value: "8"
+      - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
+        value: "5000"
+      - key: ATOMIC_COMPONENT_PARSE_CHUNK
+        value: "10"
+      - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
+        value: "1500000"
       - key: BATCH_FRESH_CACHE_MS
         value: "90000"
       - key: BATCH_STALE_CACHE_MS
