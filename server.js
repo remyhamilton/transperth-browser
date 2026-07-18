@@ -69,7 +69,7 @@ const cache = new Map();
 const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
-// v3.0: service rows are never reused for strict-fresh requests. This map stores
+// v3.1: service rows are never reused for strict-fresh requests. This map stores
 // only which component stop IDs recently produced live rows, so a large grouped
 // stop can scan the most promising stands first without returning stale times.
 const groupedStopHotness = new Map();
@@ -118,7 +118,10 @@ const stats = {
   completeSnapshotRequests: 0,
   completeSnapshotCacheHits: 0,
   completeSnapshotPublishes: 0,
-  completeSnapshotColdBuilds: 0
+  completeSnapshotColdBuilds: 0,
+  componentBatchRequests: 0,
+  componentBatchCompleted: 0,
+  componentBatchFailedStops: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -802,7 +805,7 @@ async function scrapeStop(stopId, limit, options = {}) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v3.0-fresh-live-board",
+      source: "136213-browser-v3.1-fresh-live-board",
       freshLive: options.forceRefresh === true,
       liveOnly,
       rawRowCount: parsed.rawRowCount,
@@ -957,7 +960,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: payload?.ok !== false,
       stopName: payload?.stopName || `Stop ${stopId}`,
-      source: payload?.source || "136213-browser-v3.0-batch",
+      source: payload?.source || "136213-browser-v3.1-batch",
       count: services.length,
       services,
       cache: payload?.cache || null,
@@ -969,7 +972,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: false,
       stopName: `Stop ${stopId}`,
-      source: "136213-browser-v3.0-batch-error",
+      source: "136213-browser-v3.1-batch-error",
       count: 0,
       services: [],
       error: String(error.message || error),
@@ -1006,8 +1009,8 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
     return {
       ok: complete,
       source: complete
-        ? "136213-browser-v3.0-complete-grouped-snapshot"
-        : "136213-browser-v3.0-complete-grouped-snapshot-failed",
+        ? "136213-browser-v3.1-complete-grouped-snapshot"
+        : "136213-browser-v3.1-complete-grouped-snapshot-failed",
       grouped: true,
       completeOnly: true,
       groupedCompleteSnapshot: complete,
@@ -1081,7 +1084,7 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
 
   return {
     ok: true,
-    source: "136213-browser-v3.0-hot-first-batched-stops",
+    source: "136213-browser-v3.1-hot-first-batched-stops",
     grouped: true,
     completeOnly: false,
     groupedCompleteSnapshot: false,
@@ -1449,7 +1452,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.0",
+    service: "transperth-browser-v3.1",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1490,6 +1493,93 @@ app.get("/health", async (req, res) => {
   }
 });
 
+
+
+// v3.1: bounded per-component refresh endpoint. The Worker uses this only for
+// missing/stale component stop snapshots, so a 29-stop group no longer needs a
+// fresh 29-stop browser rebuild on every open. fetchStopShared already coalesces
+// overlapping requests for the same stop ID and the page pool remains capped.
+app.get("/live-stop-components", async (req, res) => {
+  stats.requests += 1;
+  stats.componentBatchRequests += 1;
+
+  if (!authOk(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const stopIds = uniqueStopIds(req.query.stops || req.query.stopIds || req.query.ids);
+  if (!stopIds.length) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing stop IDs. Use stops=123,456"
+    });
+  }
+
+  const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 10, 1, 24);
+  const forceRefresh = String(req.query.fresh || req.query.refresh || "") === "1";
+  const liveOnly = String(req.query.liveOnly || req.query.live || "1") !== "0";
+  const startedAt = Date.now();
+
+  try {
+    const rowsByStop = await mapLimit(
+      stopIds,
+      Math.max(1, POOL_SIZE),
+      stopId => scanGroupedStopV29(stopId, perStop, {
+        forceRefresh,
+        liveOnly,
+        allowStale: !forceRefresh,
+        // A strict refresh should still replace the Browser's individual-stop
+        // cache so subsequent overlapping groups can reuse the completed stop.
+        cacheResult: true,
+        hotFirst: false,
+        backgroundComplete: false
+      })
+    );
+
+    const failedStopIds = rowsByStop
+      .filter(row => row?.ok === false)
+      .map(row => row.stopId);
+    const complete = rowsByStop.length === stopIds.length && failedStopIds.length === 0;
+    const services = rowsByStop.flatMap(row => row?.services || []);
+
+    stats.componentBatchCompleted += complete ? 1 : 0;
+    stats.componentBatchFailedStops += failedStopIds.length;
+
+    res.set("Cache-Control", "no-store");
+    return res.status(complete ? 200 : 207).json({
+      ok: complete,
+      source: complete
+        ? "136213-browser-v3.1-component-stop-snapshots"
+        : "136213-browser-v3.1-component-stop-snapshots-partial",
+      componentSnapshots: true,
+      grouped: stopIds.length > 1,
+      stopIds,
+      perStop,
+      componentCount: stopIds.length,
+      scannedComponentCount: rowsByStop.length,
+      failedStopIds,
+      groupedScanComplete: complete,
+      authoritativeEmptyBoard: complete && services.length === 0,
+      rowsByStop,
+      services,
+      count: services.length,
+      fetchedAt: new Date().toISOString(),
+      timings: { requestTotalMs: Date.now() - startedAt }
+    });
+  } catch (error) {
+    stats.batchErrors += 1;
+    return res.status(504).json({
+      ok: false,
+      source: "136213-browser-v3.1-component-stop-snapshots-error",
+      componentSnapshots: true,
+      stopIds,
+      perStop,
+      error: String(error.message || error),
+      fetchedAt: new Date().toISOString(),
+      timings: { requestTotalMs: Date.now() - startedAt }
+    });
+  }
+});
 
 app.get("/live-stops", async (req, res) => {
   stats.requests += 1;
@@ -1539,7 +1629,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.0-batched-stops",
+      source: "136213-browser-v3.1-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -1619,7 +1709,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v3.0 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v3.1 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
