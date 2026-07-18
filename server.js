@@ -29,6 +29,10 @@ const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000)
 const MAX_CACHE_ENTRIES = positiveInt(process.env.MAX_CACHE_ENTRIES, 250, 10, 2000);
 const BATCH_MAX_STOPS = positiveInt(process.env.BATCH_MAX_STOPS, 60, 2, 120);
 const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT_MS, 900, 250, 4000);
+const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 8, 2, 16);
+const ATOMIC_COMPONENT_HTTP_TIMEOUT_MS = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_TIMEOUT_MS, 5000, 1000, 12000);
+const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 10, 2, 24);
+const ATOMIC_COMPONENT_MAX_HTML_BYTES = positiveInt(process.env.ATOMIC_COMPONENT_MAX_HTML_BYTES, 1500000, 100000, 4000000);
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
 const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 80, 4, 250);
@@ -69,7 +73,8 @@ const cache = new Map();
 const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
-// v3.1: service rows are never reused for strict-fresh requests. This map stores
+const atomicComponentBatchInFlightV32 = new Map();
+// v3.2: service rows are never reused for strict-fresh requests. This map stores
 // only which component stop IDs recently produced live rows, so a large grouped
 // stop can scan the most promising stands first without returning stale times.
 const groupedStopHotness = new Map();
@@ -121,7 +126,14 @@ const stats = {
   completeSnapshotColdBuilds: 0,
   componentBatchRequests: 0,
   componentBatchCompleted: 0,
-  componentBatchFailedStops: 0
+  componentBatchFailedStops: 0,
+  atomicComponentBatchRequestsV32: 0,
+  atomicComponentBatchCoalescedV32: 0,
+  atomicComponentHTTPFetchesV32: 0,
+  atomicComponentHTTPSuccessesV32: 0,
+  atomicComponentHTTPFallbacksV32: 0,
+  atomicComponentHTTPErrorsV32: 0,
+  atomicComponentBatchCompletedV32: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -805,7 +817,7 @@ async function scrapeStop(stopId, limit, options = {}) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v3.1-fresh-live-board",
+      source: "136213-browser-v3.2-fresh-live-board",
       freshLive: options.forceRefresh === true,
       liveOnly,
       rawRowCount: parsed.rawRowCount,
@@ -960,7 +972,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: payload?.ok !== false,
       stopName: payload?.stopName || `Stop ${stopId}`,
-      source: payload?.source || "136213-browser-v3.1-batch",
+      source: payload?.source || "136213-browser-v3.2-batch",
       count: services.length,
       services,
       cache: payload?.cache || null,
@@ -972,7 +984,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: false,
       stopName: `Stop ${stopId}`,
-      source: "136213-browser-v3.1-batch-error",
+      source: "136213-browser-v3.2-batch-error",
       count: 0,
       services: [],
       error: String(error.message || error),
@@ -1009,8 +1021,8 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
     return {
       ok: complete,
       source: complete
-        ? "136213-browser-v3.1-complete-grouped-snapshot"
-        : "136213-browser-v3.1-complete-grouped-snapshot-failed",
+        ? "136213-browser-v3.2-complete-grouped-snapshot"
+        : "136213-browser-v3.2-complete-grouped-snapshot-failed",
       grouped: true,
       completeOnly: true,
       groupedCompleteSnapshot: complete,
@@ -1084,7 +1096,7 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
 
   return {
     ok: true,
-    source: "136213-browser-v3.1-hot-first-batched-stops",
+    source: "136213-browser-v3.2-hot-first-batched-stops",
     grouped: true,
     completeOnly: false,
     groupedCompleteSnapshot: false,
@@ -1452,7 +1464,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.1",
+    service: "transperth-browser-v3.2",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1495,7 +1507,386 @@ app.get("/health", async (req, res) => {
 
 
 
-// v3.1: bounded per-component refresh endpoint. The Worker uses this only for
+
+// v3.2: fetch every component through BrowserContext.request, which shares the
+// MOBI cookie/session jar with Chromium but does not allocate one page per stop.
+// One existing Chromium page parses the returned HTML in bounded chunks. Only
+// ambiguous/failed documents fall back to normal page navigation.
+async function fetchStopHTMLDirectV32(stopId) {
+  await ensureBrowser();
+  stats.atomicComponentHTTPFetchesV32 += 1;
+  const startedAt = Date.now();
+  const requestURL = new URL(stopUrl(stopId));
+  requestURL.searchParams.set("_hubwayAtomic", String(Date.now()));
+  try {
+    const response = await context.request.get(requestURL.toString(), {
+      timeout: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS,
+      failOnStatusCode: false,
+      headers: {
+        "Accept": "text/html,application/xhtml+xml",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache"
+      }
+    });
+    const status = response.status();
+    let html = await response.text();
+    if (Buffer.byteLength(html, "utf8") > ATOMIC_COMPONENT_MAX_HTML_BYTES) {
+      throw new Error(`MOBI response too large for stop ${stopId}`);
+    }
+    const ok = status >= 200 && status < 400 && /<html|<!doctype/i.test(html);
+    if (ok) stats.atomicComponentHTTPSuccessesV32 += 1;
+    else stats.atomicComponentHTTPErrorsV32 += 1;
+    return {
+      stopId,
+      ok,
+      status,
+      html: ok ? html : "",
+      error: ok ? null : `MOBI HTTP ${status}`,
+      ms: Date.now() - startedAt
+    };
+  } catch (error) {
+    stats.atomicComponentHTTPErrorsV32 += 1;
+    return {
+      stopId,
+      ok: false,
+      status: 0,
+      html: "",
+      error: String(error?.message || error),
+      ms: Date.now() - startedAt
+    };
+  }
+}
+
+async function parseStopHTMLBatchV32(items, limit, liveOnly) {
+  const list = Array.isArray(items) ? items.filter(item => item?.ok && item?.html) : [];
+  if (!list.length) return [];
+  const page = await acquirePage();
+  activeBrowserJobs += 1;
+  try {
+    const out = [];
+    for (let offset = 0; offset < list.length; offset += ATOMIC_COMPONENT_PARSE_CHUNK) {
+      const chunk = list.slice(offset, offset + ATOMIC_COMPONENT_PARSE_CHUNK);
+      const parsed = await page.evaluate(({ entries, limitValue, liveOnlyValue }) => {
+        const clean = value => String(value || "").replace(/\s+/g, " ").trim();
+        const absolute = (href, baseURL) => {
+          if (!href) return null;
+          try { return new URL(href, baseURL).toString(); } catch { return null; }
+        };
+        const queryValue = (href, names, baseURL) => {
+          if (!href) return null;
+          try {
+            const u = new URL(href, baseURL);
+            for (const name of names) {
+              const value = u.searchParams.get(name);
+              if (value) return clean(value);
+            }
+          } catch {}
+          return null;
+        };
+
+        return entries.map(entry => {
+          const baseURL = `https://136213.mobi/RealTime/RealTimeStopResults.aspx?SN=${encodeURIComponent(entry.stopId)}`;
+          const doc = new DOMParser().parseFromString(entry.html, "text/html");
+          const rows = Array.from(doc.querySelectorAll(".tpm_row_timetable"));
+          const bodyText = clean(doc.body?.textContent || "");
+          const headingCandidates = [
+            doc.querySelector("h1"),
+            doc.querySelector("h2"),
+            doc.querySelector(".stop-name"),
+            doc.querySelector(".page-title")
+          ];
+          const stopName = headingCandidates
+            .map(node => clean(node?.textContent || ""))
+            .find(Boolean) || null;
+          const explicitEmpty = /\bno\s+(?:live\s+|real[- ]?time\s+|upcoming\s+)?(?:services|departures|results)\b|\bthere\s+are\s+no\b/i.test(bodyText);
+
+          const allServices = rows.map(row => {
+            const text = clean(row.textContent || "");
+            if (!text) return null;
+            const links = Array.from(row.querySelectorAll("a[href]"));
+            const detailHref = links
+              .map(link => link.getAttribute("href"))
+              .find(href => /RealTimeFleetTrip|fleet=/i.test(href || "")) || null;
+            const detailURL = absolute(detailHref, baseURL);
+            const route =
+              clean(row.getAttribute("data-route")) ||
+              text.match(/\b([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT|Airport Line|Armadale Line|Ellenbrook Line|Fremantle Line|Mandurah Line|Midland Line|Thornlie-Cockburn Line|Yanchep Line)\b/i)?.[1] ||
+              null;
+            const destination =
+              clean(row.querySelector(".route-display-name strong")?.textContent) ||
+              clean(row.getAttribute("data-destination")) ||
+              text.match(/To\s+.+?(?=\s+Depart from stop|\s+\d+\s*MIN|\s+\(sched|$)/i)?.[0]?.trim() ||
+              null;
+            const stopText =
+              Array.from(row.querySelectorAll(".route-display-name"))
+                .map(el => clean(el.textContent || ""))
+                .find(value => value.toLowerCase().includes("depart from stop")) ||
+              "Depart from stop";
+            const fleet =
+              clean(row.getAttribute("data-fleet")) ||
+              clean(row.dataset?.fleet) ||
+              queryValue(detailHref, ["fleet", "fleetNumber", "vehicle"], baseURL) ||
+              text.match(/\bFleet\s*#?\s*(\d{3,5})\b/i)?.[1] ||
+              null;
+            const tripId =
+              clean(row.getAttribute("data-tripid")) ||
+              clean(row.dataset?.tripid) ||
+              clean(row.dataset?.tripId) ||
+              queryValue(detailHref, ["tripId", "tripID", "trip", "t"], baseURL) ||
+              null;
+            const runNumber =
+              clean(row.getAttribute("data-run")) ||
+              clean(row.dataset?.run) ||
+              text.match(/\b(?:Run|Service)\s*#?\s*([A-Z0-9-]{2,12})\b/i)?.[1] ||
+              null;
+            const platform =
+              clean(row.getAttribute("data-platform")) ||
+              text.match(/\bPlatform\s*([0-9]+[A-Z]?)\b/i)?.[1] ||
+              null;
+            const scheduled = /\(sched\.?\)|\bscheduled\b/i.test(text);
+            const isLive = !scheduled && (
+              row.classList.contains("fleet-running") ||
+              row.classList.contains("live") ||
+              Boolean(fleet) ||
+              /\bLIVE\b|\barriving\b|\bdeparting\b/i.test(text)
+            );
+            const due =
+              text.match(/\b\d+\s*MIN\b/i)?.[0]?.replace(/\s+/g, " ").toUpperCase() ||
+              (/\barriving\b/i.test(text) ? "Arriving" : null);
+            const dueMinutesMatch = due?.match(/\d+/);
+            const minutesUntilDeparture = dueMinutesMatch
+              ? Number(dueMinutesMatch[0])
+              : (due === "Arriving" ? 0 : null);
+            const time = text.match(/\b\d{1,2}[:.]\d{2}\s*(?:am|pm)\b/i)?.[0]?.replace(/\s+/g, "") || null;
+            return {
+              route: route ? clean(route) : null,
+              destination: destination ? clean(destination) : null,
+              stopText,
+              stopId: String(entry.stopId),
+              due,
+              dueText: due,
+              minutesUntilDeparture,
+              time,
+              departureTime: time,
+              liveTime: isLive ? time : null,
+              statusText: isLive ? "Live" : "Scheduled",
+              scheduled,
+              live: isLive,
+              workerLive: isLive,
+              workerMobiBoardRow: true,
+              workerMobiLiveRow: isLive,
+              workerMobiScheduledRow: !isLive,
+              fleetNumber: fleet,
+              fleet,
+              tripId,
+              runNumber,
+              platform,
+              detailURL: detailURL || (fleet
+                ? `https://136213.mobi/RealTime/RealTimeFleetTrip.aspx?nq=true&fleet=${encodeURIComponent(fleet)}`
+                : null),
+              rawText: text.slice(0, 420)
+            };
+          }).filter(service => service && service.route && service.destination);
+
+          const services = (liveOnlyValue
+            ? allServices.filter(service => service.live === true)
+            : allServices
+          ).slice(0, limitValue);
+          return {
+            stopId: String(entry.stopId),
+            stopName: stopName || `Stop ${entry.stopId}`,
+            services,
+            rawRowCount: allServices.length,
+            liveRowCount: allServices.filter(service => service.live === true).length,
+            explicitEmpty,
+            hasTimetableMarkup: rows.length > 0
+          };
+        });
+      }, { entries: chunk, limitValue: limit, liveOnlyValue: liveOnly });
+      out.push(...parsed);
+    }
+    return out;
+  } finally {
+    activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+    if (!page.isClosed()) releasePage(page);
+    else void replaceDeadPage(page, "atomic-html-parser-closed");
+  }
+}
+
+async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
+  const startedAt = Date.now();
+  const liveOnly = options.liveOnly !== false;
+  const forceRefresh = options.forceRefresh !== false;
+  const directStartedAt = Date.now();
+  const direct = await mapLimit(
+    stopIds,
+    ATOMIC_COMPONENT_HTTP_CONCURRENCY,
+    stopId => fetchStopHTMLDirectV32(stopId)
+  );
+  const directFetchMs = Date.now() - directStartedAt;
+  const parsed = await parseStopHTMLBatchV32(direct, perStop, liveOnly);
+  const parsedByStop = new Map(parsed.map(row => [String(row.stopId), row]));
+  const directByStop = new Map(direct.map(row => [String(row.stopId), row]));
+  const resultByStop = new Map();
+  const fallbackIds = [];
+  const fetchedAt = new Date().toISOString();
+
+  for (const stopId of stopIds) {
+    const parsedRow = parsedByStop.get(String(stopId));
+    const directRow = directByStop.get(String(stopId));
+    const directUsable = Boolean(
+      directRow?.ok && parsedRow &&
+      (parsedRow.hasTimetableMarkup || parsedRow.explicitEmpty)
+    );
+    if (!directUsable) {
+      fallbackIds.push(String(stopId));
+      continue;
+    }
+    const services = (parsedRow.services || []).map(service => ({
+      ...service,
+      observedAt: fetchedAt,
+      liveFetchedAt: fetchedAt
+    }));
+    const payload = {
+      ok: true,
+      stopId: String(stopId),
+      stopName: parsedRow.stopName || `Stop ${stopId}`,
+      source: "136213-browser-v3.2-shared-session-http",
+      freshLive: forceRefresh,
+      liveOnly,
+      rawRowCount: parsedRow.rawRowCount,
+      liveRowCount: parsedRow.liveRowCount,
+      count: services.length,
+      services,
+      fetchedAt,
+      timings: { browserMs: Number(directRow?.ms || 0), rowWaitMs: 0 }
+    };
+    setCache(cacheKey(String(stopId), perStop, liveOnly), payload);
+    updateGroupedStopHotnessV29(stopId, services.filter(row => row?.live === true).length);
+    resultByStop.set(String(stopId), {
+      stopId: String(stopId),
+      ok: true,
+      stopName: payload.stopName,
+      source: payload.source,
+      count: services.length,
+      services,
+      cache: { hit: false, directHTTP: true },
+      directHTTP: true,
+      authoritativeEmptyBoard: services.length === 0 && parsedRow.explicitEmpty === true,
+      ms: Number(directRow?.ms || 0)
+    });
+  }
+
+  let fallbackMs = 0;
+  if (fallbackIds.length) {
+    stats.atomicComponentHTTPFallbacksV32 += fallbackIds.length;
+    const fallbackStartedAt = Date.now();
+    const fallbackRows = await mapLimit(
+      fallbackIds,
+      Math.max(1, POOL_SIZE),
+      stopId => scanGroupedStopV29(stopId, perStop, {
+        forceRefresh,
+        liveOnly,
+        allowStale: false,
+        cacheResult: true,
+        hotFirst: false,
+        backgroundComplete: false
+      })
+    );
+    fallbackMs = Date.now() - fallbackStartedAt;
+    for (const row of fallbackRows) resultByStop.set(String(row.stopId), { ...row, directHTTP: false });
+  }
+
+  const rowsByStop = stopIds.map(stopId => resultByStop.get(String(stopId)) || {
+    stopId: String(stopId),
+    ok: false,
+    stopName: `Stop ${stopId}`,
+    source: "136213-browser-v3.2-atomic-component-missing",
+    count: 0,
+    services: [],
+    error: "Component did not complete"
+  });
+  const failedStopIds = rowsByStop.filter(row => row?.ok === false).map(row => row.stopId);
+  const completedComponentCount = rowsByStop.length - failedStopIds.length;
+  const services = rowsByStop.flatMap(row => row?.services || []);
+  const complete = failedStopIds.length === 0 && rowsByStop.length === stopIds.length;
+  if (complete) stats.atomicComponentBatchCompletedV32 += 1;
+  return {
+    ok: complete,
+    source: complete
+      ? "136213-browser-v3.2-atomic-shared-session-components"
+      : "136213-browser-v3.2-atomic-shared-session-components-partial",
+    componentSnapshots: true,
+    atomicBoard: true,
+    sharedSessionHTTPV32: true,
+    grouped: stopIds.length > 1,
+    stopIds,
+    perStop,
+    componentCount: stopIds.length,
+    completedComponentCount,
+    failedComponentCount: failedStopIds.length,
+    scannedComponentCount: rowsByStop.length,
+    failedStopIds,
+    groupedScanComplete: complete,
+    authoritativeEmptyBoard: complete && services.length === 0,
+    rowsByStop,
+    services,
+    count: services.length,
+    fetchedAt: new Date().toISOString(),
+    timings: {
+      requestTotalMs: Date.now() - startedAt,
+      directFetchMs,
+      fallbackMs,
+      directHTTPCount: stopIds.length - fallbackIds.length,
+      pageFallbackCount: fallbackIds.length,
+      httpConcurrency: ATOMIC_COMPONENT_HTTP_CONCURRENCY
+    }
+  };
+}
+
+app.get("/live-stop-components-atomic", async (req, res) => {
+  stats.requests += 1;
+  stats.atomicComponentBatchRequestsV32 += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  const stopIds = uniqueStopIds(req.query.stops || req.query.stopIds || req.query.ids);
+  if (!stopIds.length) {
+    return res.status(400).json({ ok: false, error: "Missing stop IDs. Use stops=123,456" });
+  }
+  const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 5, 1, 24);
+  const liveOnly = String(req.query.liveOnly || req.query.live || "1") !== "0";
+  const forceRefresh = String(req.query.fresh || req.query.refresh || "1") !== "0";
+  const key = `${stopIds.slice().sort((a, b) => Number(a) - Number(b)).join(",")}|${perStop}|${liveOnly ? 1 : 0}|${forceRefresh ? 1 : 0}`;
+  let promise = atomicComponentBatchInFlightV32.get(key);
+  if (promise) {
+    stats.atomicComponentBatchCoalescedV32 += 1;
+  } else {
+    promise = buildAtomicComponentBatchV32(stopIds, perStop, { liveOnly, forceRefresh })
+      .finally(() => {
+        if (atomicComponentBatchInFlightV32.get(key) === promise) {
+          atomicComponentBatchInFlightV32.delete(key);
+        }
+      });
+    atomicComponentBatchInFlightV32.set(key, promise);
+  }
+  try {
+    const payload = await promise;
+    res.set("Cache-Control", "no-store");
+    return res.status(payload.ok ? 200 : 207).json(payload);
+  } catch (error) {
+    stats.batchErrors += 1;
+    return res.status(504).json({
+      ok: false,
+      source: "136213-browser-v3.2-atomic-shared-session-error",
+      atomicBoard: true,
+      stopIds,
+      perStop,
+      error: String(error?.message || error),
+      fetchedAt: new Date().toISOString()
+    });
+  }
+});
+
+// v3.2: bounded per-component refresh endpoint. The Worker uses this only for
 // missing/stale component stop snapshots, so a 29-stop group no longer needs a
 // fresh 29-stop browser rebuild on every open. fetchStopShared already coalesces
 // overlapping requests for the same stop ID and the page pool remains capped.
@@ -1549,8 +1940,8 @@ app.get("/live-stop-components", async (req, res) => {
     return res.status(complete ? 200 : 207).json({
       ok: complete,
       source: complete
-        ? "136213-browser-v3.1-component-stop-snapshots"
-        : "136213-browser-v3.1-component-stop-snapshots-partial",
+        ? "136213-browser-v3.2-component-stop-snapshots"
+        : "136213-browser-v3.2-component-stop-snapshots-partial",
       componentSnapshots: true,
       grouped: stopIds.length > 1,
       stopIds,
@@ -1570,7 +1961,7 @@ app.get("/live-stop-components", async (req, res) => {
     stats.batchErrors += 1;
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.1-component-stop-snapshots-error",
+      source: "136213-browser-v3.2-component-stop-snapshots-error",
       componentSnapshots: true,
       stopIds,
       perStop,
@@ -1629,7 +2020,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.1-batched-stops",
+      source: "136213-browser-v3.2-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -1709,7 +2100,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v3.1 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v3.2 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
