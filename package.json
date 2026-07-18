@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.1.0",
-  "description": "Memory-bounded Transperth browser with coalesced per-component stop snapshots and complete grouped-stop stale-while-refresh delivery",
+  "version": "3.2.0",
+  "description": "Atomic grouped-stop browser using shared-session parallel HTTP component fetches with bounded Chromium fallback",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
