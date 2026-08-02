@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.4.0",
-  "description": "All-ID grouped-stop multiplex server: every component is requested concurrently in one wave, with complete aggregate caching and bounded retries",
+  "version": "3.5.0",
+  "description": "Fast all-ID grouped-stop multiplex server: native keep-alive HTTP, Node streaming parser, verified empty-stop completion, bounded context retry",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
