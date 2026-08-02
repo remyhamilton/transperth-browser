@@ -17,7 +17,7 @@ app.use(express.json({ limit: "64kb" }));
 
 const PORT = positiveInt(process.env.PORT, 3000, 1, 65535);
 const BROWSER_TOKEN = String(process.env.BROWSER_TOKEN || "").trim();
-const POOL_SIZE = positiveInt(process.env.BROWSER_POOL_SIZE, 2, 1, 4);
+const POOL_SIZE = positiveInt(process.env.BROWSER_POOL_SIZE, 4, 1, 8);
 const NAVIGATION_TIMEOUT_MS = positiveInt(process.env.NAVIGATION_TIMEOUT_MS, 12000, 3000, 30000);
 const ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.ROW_WAIT_TIMEOUT_MS, 6500, 1000, 15000);
 const LIVE_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.LIVE_ROW_WAIT_TIMEOUT_MS, 1800, 250, 6000);
@@ -29,12 +29,12 @@ const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000)
 const MAX_CACHE_ENTRIES = positiveInt(process.env.MAX_CACHE_ENTRIES, 250, 10, 2000);
 const BATCH_MAX_STOPS = positiveInt(process.env.BATCH_MAX_STOPS, 60, 2, 120);
 const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT_MS, 900, 250, 4000);
-const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 12, 2, 20);
-const ATOMIC_COMPONENT_HTTP_TIMEOUT_MS = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_TIMEOUT_MS, 5000, 1000, 12000);
+const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 60, 2, 120);
+const ATOMIC_COMPONENT_HTTP_TIMEOUT_MS = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_TIMEOUT_MS, 6000, 1000, 12000);
 const ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 1, 0, 2);
-const ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS, 100, 0, 1000);
-const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 4, 1, 6);
-const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 10, 2, 24);
+const ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS, 60, 0, 1000);
+const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 6, 1, 8);
+const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 60, 2, 120);
 const ATOMIC_COMPONENT_MAX_HTML_BYTES = positiveInt(process.env.ATOMIC_COMPONENT_MAX_HTML_BYTES, 1500000, 100000, 4000000);
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
@@ -138,7 +138,11 @@ const stats = {
   atomicComponentHTTPRetryFetchesV33: 0,
   atomicComponentHTTPRetryRecoveriesV33: 0,
   atomicComponentHTTPErrorsV32: 0,
-  atomicComponentBatchCompletedV32: 0
+  atomicComponentBatchCompletedV32: 0,
+  atomicComponentAggregateCacheHitsV34: 0,
+  atomicComponentFreshCacheHitsV34: 0,
+  atomicComponentStaleRescuesV34: 0,
+  atomicComponentOneWaveBuildsV34: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -1469,7 +1473,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.3",
+    service: "transperth-browser-v3.4",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1488,6 +1492,7 @@ app.get("/", (req, res) => {
       "/health",
       "/live-stop/26768?limit=5",
       "/live-stops?stops=27172,27180,27184&perStop=10&completeOnly=1",
+      "/live-stop-components-multiplex?stops=27431,27432,27433,27434,27435,27437,27438,27439,27440,27441,27442&perStop=30&liveOnly=0",
       "/warm-service-packets",
       "/warm-service-packets/status"
     ]
@@ -1718,7 +1723,7 @@ async function parseStopHTMLBatchV32(items, limit, liveOnly) {
   }
 }
 
-async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
+async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
   const startedAt = Date.now();
   const liveOnly = options.liveOnly !== false;
   const forceRefresh = options.forceRefresh !== false;
@@ -1728,23 +1733,69 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
     0,
     2
   );
+  const preferFreshComponentCache = options.preferFreshComponentCache !== false;
+  const allowStaleComponentRescue = options.allowStaleComponentRescue !== false;
   const resultByStop = new Map();
   const fetchedAt = new Date().toISOString();
-  let unresolvedIds = stopIds.map(String);
   let directFetchMs = 0;
   let directParseMs = 0;
   let directAttemptCount = 0;
   let directRetryRecoveredCount = 0;
+  let directWaveCount = 0;
+  let freshComponentCacheHitCount = 0;
+  let staleComponentRescueCount = 0;
+
+  const cachedResult = (stopId, cached, staleRescue = false) => {
+    const payload = cached?.payload;
+    if (!payload || payload.ok === false || !Array.isArray(payload.services)) return false;
+    resultByStop.set(String(stopId), {
+      stopId: String(stopId),
+      ok: true,
+      stopName: payload.stopName || `Stop ${stopId}`,
+      source: staleRescue
+        ? "136213-browser-v3.4-stale-component-rescue"
+        : "136213-browser-v3.4-fresh-component-cache",
+      count: payload.services.length,
+      services: payload.services,
+      cache: {
+        hit: true,
+        stale: cached.stale === true,
+        ageMs: Number(cached.ageMs || 0),
+        directHTTP: false
+      },
+      directHTTP: false,
+      authoritativeEmptyBoard:
+        payload.authoritativeEmptyBoard === true ||
+        (payload.services.length === 0 && Number(payload.rawRowCount || 0) === 0),
+      ms: 0
+    });
+    return true;
+  };
+
+  if (preferFreshComponentCache) {
+    for (const rawStopId of stopIds) {
+      const stopId = String(rawStopId);
+      const cached = getCache(cacheKey(stopId, perStop, liveOnly), false);
+      if (cachedResult(stopId, cached, false)) freshComponentCacheHitCount += 1;
+    }
+  }
+
+  let unresolvedIds = stopIds.map(String).filter(stopId => !resultByStop.has(stopId));
 
   for (let round = 0; round <= retryRounds && unresolvedIds.length; round += 1) {
     if (round > 0 && ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS > 0) {
       await new Promise(resolve => setTimeout(resolve, ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS));
     }
     const roundIds = unresolvedIds.slice();
+    const directConcurrency = Math.max(
+      1,
+      Math.min(ATOMIC_COMPONENT_HTTP_CONCURRENCY, roundIds.length)
+    );
+    directWaveCount += Math.ceil(roundIds.length / directConcurrency);
     const fetchStartedAt = Date.now();
     const direct = await mapLimit(
       roundIds,
-      ATOMIC_COMPONENT_HTTP_CONCURRENCY,
+      directConcurrency,
       stopId => fetchStopHTMLDirectV32(stopId)
     );
     directFetchMs += Date.now() - fetchStartedAt;
@@ -1780,8 +1831,8 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
         stopId: String(stopId),
         stopName: parsedRow.stopName || `Stop ${stopId}`,
         source: round > 0
-          ? "136213-browser-v3.3-shared-session-http-retry"
-          : "136213-browser-v3.3-shared-session-http",
+          ? "136213-browser-v3.4-all-ids-concurrent-http-retry"
+          : "136213-browser-v3.4-all-ids-concurrent-http",
         freshLive: forceRefresh,
         liveOnly,
         rawRowCount: parsedRow.rawRowCount,
@@ -1815,6 +1866,16 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
   }
   stats.atomicComponentHTTPRetryRecoveriesV33 += directRetryRecoveredCount;
 
+  if (allowStaleComponentRescue && unresolvedIds.length) {
+    const stillUnresolved = [];
+    for (const stopId of unresolvedIds) {
+      const cached = getCache(cacheKey(String(stopId), perStop, liveOnly), true);
+      if (cachedResult(stopId, cached, true)) staleComponentRescueCount += 1;
+      else stillUnresolved.push(String(stopId));
+    }
+    unresolvedIds = stillUnresolved;
+  }
+
   let fallbackMs = 0;
   const fallbackIds = unresolvedIds.slice();
   if (fallbackIds.length) {
@@ -1822,7 +1883,7 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
     const fallbackStartedAt = Date.now();
     const fallbackRows = await mapLimit(
       fallbackIds,
-      ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY,
+      Math.min(ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, fallbackIds.length),
       stopId => scanGroupedStopV29(stopId, perStop, {
         forceRefresh,
         liveOnly,
@@ -1842,7 +1903,7 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
     stopId: String(stopId),
     ok: false,
     stopName: `Stop ${stopId}`,
-    source: "136213-browser-v3.3-atomic-component-missing",
+    source: "136213-browser-v3.4-all-ids-component-missing",
     count: 0,
     services: [],
     error: "Component did not complete"
@@ -1852,15 +1913,29 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
   const services = rowsByStop.flatMap(row => row?.services || []);
   const complete = failedStopIds.length === 0 && rowsByStop.length === stopIds.length;
   if (complete) stats.atomicComponentBatchCompletedV32 += 1;
+  stats.atomicComponentFreshCacheHitsV34 += freshComponentCacheHitCount;
+  stats.atomicComponentStaleRescuesV34 += staleComponentRescueCount;
+  if (directWaveCount <= 1) stats.atomicComponentOneWaveBuildsV34 += 1;
+
   return {
     ok: complete,
     source: complete
-      ? "136213-browser-v3.3-atomic-shared-session-components"
-      : "136213-browser-v3.3-atomic-shared-session-components-partial",
+      ? "136213-browser-v3.4-all-ids-concurrent-complete"
+      : "136213-browser-v3.4-all-ids-concurrent-partial",
     componentSnapshots: true,
     atomicBoard: true,
     sharedSessionHTTPV32: true,
     allComponentIDsOneRequestV33: true,
+    allIDsConcurrentV34: true,
+    upstreamSingleStopEndpointV34: true,
+    upstreamRequestsIssuedTogetherV34: true,
+    upstreamRequestCountV34: stopIds.length - freshComponentCacheHitCount,
+    upstreamFetchWaveCountV34: directWaveCount,
+    upstreamOneWaveV34: directWaveCount <= 1,
+    foregroundPageFallbackV34: fallbackIds.length > 0,
+    aggregateCacheHitV34: false,
+    freshComponentCacheHitCountV34: freshComponentCacheHitCount,
+    staleComponentRescueCountV34: staleComponentRescueCount,
     grouped: stopIds.length > 1,
     stopIds,
     perStop,
@@ -1880,18 +1955,22 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
       directFetchMs,
       directParseMs,
       fallbackMs,
-      directHTTPCount: stopIds.length - fallbackIds.length,
+      directHTTPCount: stopIds.length - fallbackIds.length - freshComponentCacheHitCount,
       pageFallbackCount: fallbackIds.length,
       directAttemptCount,
       directRetryRounds: retryRounds,
       directRetryRecoveredCount,
       httpConcurrency: ATOMIC_COMPONENT_HTTP_CONCURRENCY,
-      pageFallbackConcurrency: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
+      pageFallbackConcurrency: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY,
+      upstreamFetchWaveCountV34: directWaveCount
     }
   };
 }
 
-app.get("/live-stop-components-atomic", async (req, res) => {
+app.get([
+  "/live-stop-components-atomic",
+  "/live-stop-components-multiplex"
+], async (req, res) => {
   stats.requests += 1;
   stats.atomicComponentBatchRequestsV32 += 1;
   if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -1902,30 +1981,64 @@ app.get("/live-stop-components-atomic", async (req, res) => {
   const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 5, 1, 30);
   const liveOnly = String(req.query.liveOnly || req.query.live || "1") !== "0";
   const retryRounds = positiveInt(req.query.retryRounds, ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 0, 2);
-  const forceRefresh = String(req.query.fresh || req.query.refresh || "1") !== "0";
-  const key = `${stopIds.slice().sort((a, b) => Number(a) - Number(b)).join(",")}|${perStop}|${liveOnly ? 1 : 0}|${forceRefresh ? 1 : 0}|retry=${retryRounds}`;
+  const forceRefresh = String(req.query.fresh || req.query.refresh || "0") !== "0";
+  const forceAggregateRefresh = String(req.query.forceAggregateRefresh || "0") === "1";
+  const preferFreshComponentCache = String(req.query.preferFreshComponentCache || "1") !== "0";
+  const allowStaleComponentRescue = String(req.query.allowStaleComponentRescue || "1") !== "0";
+  const maxAgeMs = positiveInt(req.query.maxAgeMs, 12000, 0, 120000);
+  const stableIds = stopIds.slice().sort((a, b) => Number(a) - Number(b));
+  const aggregateKey = `atomic-v34|${stableIds.join(",")}|${perStop}|${liveOnly ? 1 : 0}`;
+
+  if (!forceAggregateRefresh) {
+    const cached = getBatchCache(aggregateKey, false);
+    if (cached && cached.ageMs <= maxAgeMs && cached.payload?.ok === true) {
+      stats.atomicComponentAggregateCacheHitsV34 += 1;
+      res.set("Cache-Control", "no-store");
+      return res.status(200).json({
+        ...cached.payload,
+        source: "136213-browser-v3.4-all-ids-aggregate-cache",
+        aggregateCacheHitV34: true,
+        aggregateCacheAgeMsV34: cached.ageMs,
+        allIDsConcurrentV34: true,
+        upstreamRequestsIssuedTogetherV34: true,
+        upstreamRequestCountV34: 0,
+        upstreamFetchWaveCountV34: 0,
+        upstreamOneWaveV34: true,
+        fetchedAt: new Date().toISOString()
+      });
+    }
+  }
+
+  const key = `${aggregateKey}|retry=${retryRounds}|fresh=${forceRefresh ? 1 : 0}`;
   let promise = atomicComponentBatchInFlightV32.get(key);
   if (promise) {
     stats.atomicComponentBatchCoalescedV32 += 1;
   } else {
-    promise = buildAtomicComponentBatchV32(stopIds, perStop, { liveOnly, forceRefresh, retryRounds })
-      .finally(() => {
-        if (atomicComponentBatchInFlightV32.get(key) === promise) {
-          atomicComponentBatchInFlightV32.delete(key);
-        }
-      });
+    promise = buildAtomicComponentBatchV34(stopIds, perStop, {
+      liveOnly,
+      forceRefresh,
+      retryRounds,
+      preferFreshComponentCache,
+      allowStaleComponentRescue
+    }).finally(() => {
+      if (atomicComponentBatchInFlightV32.get(key) === promise) {
+        atomicComponentBatchInFlightV32.delete(key);
+      }
+    });
     atomicComponentBatchInFlightV32.set(key, promise);
   }
   try {
     const payload = await promise;
+    if (payload.ok === true) setBatchCache(aggregateKey, payload, { markRequested: true });
     res.set("Cache-Control", "no-store");
     return res.status(payload.ok ? 200 : 207).json(payload);
   } catch (error) {
     stats.batchErrors += 1;
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.3-atomic-shared-session-error",
+      source: "136213-browser-v3.4-all-ids-concurrent-error",
       atomicBoard: true,
+      allIDsConcurrentV34: true,
       stopIds,
       perStop,
       error: String(error?.message || error),
@@ -1934,7 +2047,7 @@ app.get("/live-stop-components-atomic", async (req, res) => {
   }
 });
 
-// v3.3: bounded per-component refresh endpoint. The Worker uses this only for
+// v3.4: bounded per-component refresh endpoint. The Worker uses this only for
 // missing/stale component stop snapshots, so a 29-stop group no longer needs a
 // fresh 29-stop browser rebuild on every open. fetchStopShared already coalesces
 // overlapping requests for the same stop ID and the page pool remains capped.
@@ -2148,7 +2261,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v3.3 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v3.4 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
