@@ -39,7 +39,7 @@ services:
       - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
         value: "60"
       - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
-        value: "6000"
+        value: "2600"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
         value: "1"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
@@ -50,6 +50,14 @@ services:
         value: "60"
       - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
         value: "1500000"
+      - key: ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35
+        value: "4200"
+      - key: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35
+        value: "2600"
+      - key: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35
+        value: "1"
+      - key: ATOMIC_FOREGROUND_PAGE_FALLBACK_V35
+        value: "0"
       - key: BATCH_FRESH_CACHE_MS
         value: "15000"
       - key: BATCH_STALE_CACHE_MS
