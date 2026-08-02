@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.3.0",
-  "description": "All-ID atomic grouped-stop browser using shared-session parallel HTTP fetches, direct retries and bounded Chromium fallback",
+  "version": "3.4.0",
+  "description": "All-ID grouped-stop multiplex server: every component is requested concurrently in one wave, with complete aggregate caching and bounded retries",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
