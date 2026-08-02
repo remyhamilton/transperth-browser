@@ -37,9 +37,15 @@ services:
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
-        value: "8"
+        value: "12"
       - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
         value: "5000"
+      - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
+        value: "1"
+      - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
+        value: "100"
+      - key: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
+        value: "4"
       - key: ATOMIC_COMPONENT_PARSE_CHUNK
         value: "10"
       - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
