@@ -29,8 +29,11 @@ const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000)
 const MAX_CACHE_ENTRIES = positiveInt(process.env.MAX_CACHE_ENTRIES, 250, 10, 2000);
 const BATCH_MAX_STOPS = positiveInt(process.env.BATCH_MAX_STOPS, 60, 2, 120);
 const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT_MS, 900, 250, 4000);
-const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 8, 2, 16);
+const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 12, 2, 20);
 const ATOMIC_COMPONENT_HTTP_TIMEOUT_MS = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_TIMEOUT_MS, 5000, 1000, 12000);
+const ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 1, 0, 2);
+const ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS, 100, 0, 1000);
+const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 4, 1, 6);
 const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 10, 2, 24);
 const ATOMIC_COMPONENT_MAX_HTML_BYTES = positiveInt(process.env.ATOMIC_COMPONENT_MAX_HTML_BYTES, 1500000, 100000, 4000000);
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
@@ -74,7 +77,7 @@ const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
 const atomicComponentBatchInFlightV32 = new Map();
-// v3.2: service rows are never reused for strict-fresh requests. This map stores
+// v3.3: service rows are never reused for strict-fresh requests. This map stores
 // only which component stop IDs recently produced live rows, so a large grouped
 // stop can scan the most promising stands first without returning stale times.
 const groupedStopHotness = new Map();
@@ -132,6 +135,8 @@ const stats = {
   atomicComponentHTTPFetchesV32: 0,
   atomicComponentHTTPSuccessesV32: 0,
   atomicComponentHTTPFallbacksV32: 0,
+  atomicComponentHTTPRetryFetchesV33: 0,
+  atomicComponentHTTPRetryRecoveriesV33: 0,
   atomicComponentHTTPErrorsV32: 0,
   atomicComponentBatchCompletedV32: 0
 };
@@ -817,7 +822,7 @@ async function scrapeStop(stopId, limit, options = {}) {
       ok: true,
       stopId,
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v3.2-fresh-live-board",
+      source: "136213-browser-v3.3-fresh-live-board",
       freshLive: options.forceRefresh === true,
       liveOnly,
       rawRowCount: parsed.rawRowCount,
@@ -972,7 +977,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: payload?.ok !== false,
       stopName: payload?.stopName || `Stop ${stopId}`,
-      source: payload?.source || "136213-browser-v3.2-batch",
+      source: payload?.source || "136213-browser-v3.3-batch",
       count: services.length,
       services,
       cache: payload?.cache || null,
@@ -984,7 +989,7 @@ async function scanGroupedStopV29(stopId, perStop, options = {}) {
       stopId,
       ok: false,
       stopName: `Stop ${stopId}`,
-      source: "136213-browser-v3.2-batch-error",
+      source: "136213-browser-v3.3-batch-error",
       count: 0,
       services: [],
       error: String(error.message || error),
@@ -1021,8 +1026,8 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
     return {
       ok: complete,
       source: complete
-        ? "136213-browser-v3.2-complete-grouped-snapshot"
-        : "136213-browser-v3.2-complete-grouped-snapshot-failed",
+        ? "136213-browser-v3.3-complete-grouped-snapshot"
+        : "136213-browser-v3.3-complete-grouped-snapshot-failed",
       grouped: true,
       completeOnly: true,
       groupedCompleteSnapshot: complete,
@@ -1096,7 +1101,7 @@ async function buildStopsBatch(stopIds, perStop, options = {}) {
 
   return {
     ok: true,
-    source: "136213-browser-v3.2-hot-first-batched-stops",
+    source: "136213-browser-v3.3-hot-first-batched-stops",
     grouped: true,
     completeOnly: false,
     groupedCompleteSnapshot: false,
@@ -1464,7 +1469,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.2",
+    service: "transperth-browser-v3.3",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1508,7 +1513,7 @@ app.get("/health", async (req, res) => {
 
 
 
-// v3.2: fetch every component through BrowserContext.request, which shares the
+// v3.3: fetch every component through BrowserContext.request, which shares the
 // MOBI cookie/session jar with Chromium but does not allocate one page per stop.
 // One existing Chromium page parses the returned HTML in bounded chunks. Only
 // ambiguous/failed documents fall back to normal page navigation.
@@ -1717,73 +1722,107 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
   const startedAt = Date.now();
   const liveOnly = options.liveOnly !== false;
   const forceRefresh = options.forceRefresh !== false;
-  const directStartedAt = Date.now();
-  const direct = await mapLimit(
-    stopIds,
-    ATOMIC_COMPONENT_HTTP_CONCURRENCY,
-    stopId => fetchStopHTMLDirectV32(stopId)
+  const retryRounds = positiveInt(
+    options.retryRounds,
+    ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS,
+    0,
+    2
   );
-  const directFetchMs = Date.now() - directStartedAt;
-  const parsed = await parseStopHTMLBatchV32(direct, perStop, liveOnly);
-  const parsedByStop = new Map(parsed.map(row => [String(row.stopId), row]));
-  const directByStop = new Map(direct.map(row => [String(row.stopId), row]));
   const resultByStop = new Map();
-  const fallbackIds = [];
   const fetchedAt = new Date().toISOString();
+  let unresolvedIds = stopIds.map(String);
+  let directFetchMs = 0;
+  let directParseMs = 0;
+  let directAttemptCount = 0;
+  let directRetryRecoveredCount = 0;
 
-  for (const stopId of stopIds) {
-    const parsedRow = parsedByStop.get(String(stopId));
-    const directRow = directByStop.get(String(stopId));
-    const directUsable = Boolean(
-      directRow?.ok && parsedRow &&
-      (parsedRow.hasTimetableMarkup || parsedRow.explicitEmpty)
-    );
-    if (!directUsable) {
-      fallbackIds.push(String(stopId));
-      continue;
+  for (let round = 0; round <= retryRounds && unresolvedIds.length; round += 1) {
+    if (round > 0 && ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS > 0) {
+      await new Promise(resolve => setTimeout(resolve, ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS));
     }
-    const services = (parsedRow.services || []).map(service => ({
-      ...service,
-      observedAt: fetchedAt,
-      liveFetchedAt: fetchedAt
-    }));
-    const payload = {
-      ok: true,
-      stopId: String(stopId),
-      stopName: parsedRow.stopName || `Stop ${stopId}`,
-      source: "136213-browser-v3.2-shared-session-http",
-      freshLive: forceRefresh,
-      liveOnly,
-      rawRowCount: parsedRow.rawRowCount,
-      liveRowCount: parsedRow.liveRowCount,
-      count: services.length,
-      services,
-      fetchedAt,
-      timings: { browserMs: Number(directRow?.ms || 0), rowWaitMs: 0 }
-    };
-    setCache(cacheKey(String(stopId), perStop, liveOnly), payload);
-    updateGroupedStopHotnessV29(stopId, services.filter(row => row?.live === true).length);
-    resultByStop.set(String(stopId), {
-      stopId: String(stopId),
-      ok: true,
-      stopName: payload.stopName,
-      source: payload.source,
-      count: services.length,
-      services,
-      cache: { hit: false, directHTTP: true },
-      directHTTP: true,
-      authoritativeEmptyBoard: services.length === 0 && parsedRow.explicitEmpty === true,
-      ms: Number(directRow?.ms || 0)
-    });
+    const roundIds = unresolvedIds.slice();
+    const fetchStartedAt = Date.now();
+    const direct = await mapLimit(
+      roundIds,
+      ATOMIC_COMPONENT_HTTP_CONCURRENCY,
+      stopId => fetchStopHTMLDirectV32(stopId)
+    );
+    directFetchMs += Date.now() - fetchStartedAt;
+    directAttemptCount += direct.length;
+    if (round > 0) stats.atomicComponentHTTPRetryFetchesV33 += direct.length;
+
+    const parseStartedAt = Date.now();
+    const parsed = await parseStopHTMLBatchV32(direct, perStop, liveOnly);
+    directParseMs += Date.now() - parseStartedAt;
+    const parsedByStop = new Map(parsed.map(row => [String(row.stopId), row]));
+    const directByStop = new Map(direct.map(row => [String(row.stopId), row]));
+    const nextUnresolved = [];
+
+    for (const stopId of roundIds) {
+      const parsedRow = parsedByStop.get(String(stopId));
+      const directRow = directByStop.get(String(stopId));
+      const directUsable = Boolean(
+        directRow?.ok && parsedRow &&
+        (parsedRow.hasTimetableMarkup || parsedRow.explicitEmpty)
+      );
+      if (!directUsable) {
+        nextUnresolved.push(String(stopId));
+        continue;
+      }
+      if (round > 0) directRetryRecoveredCount += 1;
+      const services = (parsedRow.services || []).map(service => ({
+        ...service,
+        observedAt: fetchedAt,
+        liveFetchedAt: fetchedAt
+      }));
+      const payload = {
+        ok: true,
+        stopId: String(stopId),
+        stopName: parsedRow.stopName || `Stop ${stopId}`,
+        source: round > 0
+          ? "136213-browser-v3.3-shared-session-http-retry"
+          : "136213-browser-v3.3-shared-session-http",
+        freshLive: forceRefresh,
+        liveOnly,
+        rawRowCount: parsedRow.rawRowCount,
+        liveRowCount: parsedRow.liveRowCount,
+        count: services.length,
+        services,
+        fetchedAt,
+        timings: {
+          browserMs: Number(directRow?.ms || 0),
+          rowWaitMs: 0,
+          directAttempt: round + 1
+        }
+      };
+      setCache(cacheKey(String(stopId), perStop, liveOnly), payload);
+      updateGroupedStopHotnessV29(stopId, services.filter(row => row?.live === true).length);
+      resultByStop.set(String(stopId), {
+        stopId: String(stopId),
+        ok: true,
+        stopName: payload.stopName,
+        source: payload.source,
+        count: services.length,
+        services,
+        cache: { hit: false, directHTTP: true },
+        directHTTP: true,
+        directAttempt: round + 1,
+        authoritativeEmptyBoard: services.length === 0 && parsedRow.explicitEmpty === true,
+        ms: Number(directRow?.ms || 0)
+      });
+    }
+    unresolvedIds = nextUnresolved;
   }
+  stats.atomicComponentHTTPRetryRecoveriesV33 += directRetryRecoveredCount;
 
   let fallbackMs = 0;
+  const fallbackIds = unresolvedIds.slice();
   if (fallbackIds.length) {
     stats.atomicComponentHTTPFallbacksV32 += fallbackIds.length;
     const fallbackStartedAt = Date.now();
     const fallbackRows = await mapLimit(
       fallbackIds,
-      Math.max(1, POOL_SIZE),
+      ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY,
       stopId => scanGroupedStopV29(stopId, perStop, {
         forceRefresh,
         liveOnly,
@@ -1794,14 +1833,16 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
       })
     );
     fallbackMs = Date.now() - fallbackStartedAt;
-    for (const row of fallbackRows) resultByStop.set(String(row.stopId), { ...row, directHTTP: false });
+    for (const row of fallbackRows) {
+      resultByStop.set(String(row.stopId), { ...row, directHTTP: false });
+    }
   }
 
   const rowsByStop = stopIds.map(stopId => resultByStop.get(String(stopId)) || {
     stopId: String(stopId),
     ok: false,
     stopName: `Stop ${stopId}`,
-    source: "136213-browser-v3.2-atomic-component-missing",
+    source: "136213-browser-v3.3-atomic-component-missing",
     count: 0,
     services: [],
     error: "Component did not complete"
@@ -1814,11 +1855,12 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
   return {
     ok: complete,
     source: complete
-      ? "136213-browser-v3.2-atomic-shared-session-components"
-      : "136213-browser-v3.2-atomic-shared-session-components-partial",
+      ? "136213-browser-v3.3-atomic-shared-session-components"
+      : "136213-browser-v3.3-atomic-shared-session-components-partial",
     componentSnapshots: true,
     atomicBoard: true,
     sharedSessionHTTPV32: true,
+    allComponentIDsOneRequestV33: true,
     grouped: stopIds.length > 1,
     stopIds,
     perStop,
@@ -1836,10 +1878,15 @@ async function buildAtomicComponentBatchV32(stopIds, perStop, options = {}) {
     timings: {
       requestTotalMs: Date.now() - startedAt,
       directFetchMs,
+      directParseMs,
       fallbackMs,
       directHTTPCount: stopIds.length - fallbackIds.length,
       pageFallbackCount: fallbackIds.length,
-      httpConcurrency: ATOMIC_COMPONENT_HTTP_CONCURRENCY
+      directAttemptCount,
+      directRetryRounds: retryRounds,
+      directRetryRecoveredCount,
+      httpConcurrency: ATOMIC_COMPONENT_HTTP_CONCURRENCY,
+      pageFallbackConcurrency: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
     }
   };
 }
@@ -1852,15 +1899,16 @@ app.get("/live-stop-components-atomic", async (req, res) => {
   if (!stopIds.length) {
     return res.status(400).json({ ok: false, error: "Missing stop IDs. Use stops=123,456" });
   }
-  const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 5, 1, 24);
+  const perStop = positiveInt(req.query.perStop || req.query.limitPerStop, 5, 1, 30);
   const liveOnly = String(req.query.liveOnly || req.query.live || "1") !== "0";
+  const retryRounds = positiveInt(req.query.retryRounds, ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 0, 2);
   const forceRefresh = String(req.query.fresh || req.query.refresh || "1") !== "0";
-  const key = `${stopIds.slice().sort((a, b) => Number(a) - Number(b)).join(",")}|${perStop}|${liveOnly ? 1 : 0}|${forceRefresh ? 1 : 0}`;
+  const key = `${stopIds.slice().sort((a, b) => Number(a) - Number(b)).join(",")}|${perStop}|${liveOnly ? 1 : 0}|${forceRefresh ? 1 : 0}|retry=${retryRounds}`;
   let promise = atomicComponentBatchInFlightV32.get(key);
   if (promise) {
     stats.atomicComponentBatchCoalescedV32 += 1;
   } else {
-    promise = buildAtomicComponentBatchV32(stopIds, perStop, { liveOnly, forceRefresh })
+    promise = buildAtomicComponentBatchV32(stopIds, perStop, { liveOnly, forceRefresh, retryRounds })
       .finally(() => {
         if (atomicComponentBatchInFlightV32.get(key) === promise) {
           atomicComponentBatchInFlightV32.delete(key);
@@ -1876,7 +1924,7 @@ app.get("/live-stop-components-atomic", async (req, res) => {
     stats.batchErrors += 1;
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.2-atomic-shared-session-error",
+      source: "136213-browser-v3.3-atomic-shared-session-error",
       atomicBoard: true,
       stopIds,
       perStop,
@@ -1886,7 +1934,7 @@ app.get("/live-stop-components-atomic", async (req, res) => {
   }
 });
 
-// v3.2: bounded per-component refresh endpoint. The Worker uses this only for
+// v3.3: bounded per-component refresh endpoint. The Worker uses this only for
 // missing/stale component stop snapshots, so a 29-stop group no longer needs a
 // fresh 29-stop browser rebuild on every open. fetchStopShared already coalesces
 // overlapping requests for the same stop ID and the page pool remains capped.
@@ -1940,8 +1988,8 @@ app.get("/live-stop-components", async (req, res) => {
     return res.status(complete ? 200 : 207).json({
       ok: complete,
       source: complete
-        ? "136213-browser-v3.2-component-stop-snapshots"
-        : "136213-browser-v3.2-component-stop-snapshots-partial",
+        ? "136213-browser-v3.3-component-stop-snapshots"
+        : "136213-browser-v3.3-component-stop-snapshots-partial",
       componentSnapshots: true,
       grouped: stopIds.length > 1,
       stopIds,
@@ -1961,7 +2009,7 @@ app.get("/live-stop-components", async (req, res) => {
     stats.batchErrors += 1;
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.2-component-stop-snapshots-error",
+      source: "136213-browser-v3.3-component-stop-snapshots-error",
       componentSnapshots: true,
       stopIds,
       perStop,
@@ -2020,7 +2068,7 @@ app.get("/live-stops", async (req, res) => {
   } catch (error) {
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.2-batched-stops",
+      source: "136213-browser-v3.3-batched-stops",
       stopIds,
       error: String(error.message || error),
       fetchedAt: new Date().toISOString(),
@@ -2100,7 +2148,7 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v3.2 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v3.3 listening on port ${PORT}; pool=${POOL_SIZE}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
     void prewarmKnownGroupedStops().then(() => {
       console.log("Known grouped-stop caches prewarmed.");
