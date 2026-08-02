@@ -13,7 +13,7 @@ services:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
       - key: BROWSER_POOL_SIZE
-        value: "3"
+        value: "4"
       - key: NAVIGATION_TIMEOUT_MS
         value: "12000"
       - key: ROW_WAIT_TIMEOUT_MS
@@ -37,21 +37,21 @@ services:
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
-        value: "12"
+        value: "60"
       - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
-        value: "5000"
+        value: "6000"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
         value: "1"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
-        value: "100"
+        value: "60"
       - key: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
-        value: "4"
+        value: "6"
       - key: ATOMIC_COMPONENT_PARSE_CHUNK
-        value: "10"
+        value: "60"
       - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
         value: "1500000"
       - key: BATCH_FRESH_CACHE_MS
-        value: "90000"
+        value: "15000"
       - key: BATCH_STALE_CACHE_MS
         value: "900000"
       - key: BATCH_CACHE_MAX_ENTRIES
