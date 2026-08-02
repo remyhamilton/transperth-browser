@@ -8,6 +8,7 @@ if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
 
 const fs = require("fs");
 const crypto = require("crypto");
+const https = require("https");
 const express = require("express");
 const { chromium } = require("playwright");
 
@@ -36,6 +37,17 @@ const ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS = positiveInt(process.env.ATOMIC_CO
 const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 6, 1, 8);
 const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 60, 2, 120);
 const ATOMIC_COMPONENT_MAX_HTML_BYTES = positiveInt(process.env.ATOMIC_COMPONENT_MAX_HTML_BYTES, 1500000, 100000, 4000000);
+const ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35 = positiveInt(process.env.ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35, 4200, 1200, 8000);
+const ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35 = positiveInt(process.env.ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35, 2600, 800, 6000);
+const ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 = String(process.env.ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 || "1") !== "0";
+const ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 = String(process.env.ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 || "0") === "1";
+const ATOMIC_NATIVE_AGENT_V35 = new https.Agent({
+  keepAlive: true,
+  maxSockets: 80,
+  maxFreeSockets: 24,
+  scheduling: "lifo",
+  timeout: 10000
+});
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
 const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 80, 4, 250);
@@ -142,7 +154,14 @@ const stats = {
   atomicComponentAggregateCacheHitsV34: 0,
   atomicComponentFreshCacheHitsV34: 0,
   atomicComponentStaleRescuesV34: 0,
-  atomicComponentOneWaveBuildsV34: 0
+  atomicComponentOneWaveBuildsV34: 0,
+  atomicNativeHTTPFetchesV35: 0,
+  atomicNativeHTTPSuccessesV35: 0,
+  atomicNativeHTTPErrorsV35: 0,
+  atomicContextRetryFetchesV35: 0,
+  atomicFastParserDocumentsV35: 0,
+  atomicVerifiedEmptyComponentsV35: 0,
+  atomicPageFallbacksSkippedV35: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -1473,7 +1492,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.4",
+    service: "transperth-browser-v3.5",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1492,7 +1511,7 @@ app.get("/", (req, res) => {
       "/health",
       "/live-stop/26768?limit=5",
       "/live-stops?stops=27172,27180,27184&perStop=10&completeOnly=1",
-      "/live-stop-components-multiplex?stops=27431,27432,27433,27434,27435,27437,27438,27439,27440,27441,27442&perStop=30&liveOnly=0",
+      "/live-stop-components-multiplex?stops=27431,27432,27433,27434,27435,27437,27438,27439,27440,27441,27442&perStop=30&liveOnly=0&allowPageFallback=0",
       "/warm-service-packets",
       "/warm-service-packets/status"
     ]
@@ -1518,6 +1537,328 @@ app.get("/health", async (req, res) => {
 
 
 
+
+// v3.5: the first grouped-stop wave uses Node's native HTTPS stack with one
+// keep-alive agent. This avoids BrowserContext.request and DOMParser overhead
+// for the normal path while still issuing every component stop at the same time.
+function decodeHTMLTextV35(value) {
+  const named = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+    ndash: "–", mdash: "—", hellip: "…"
+  };
+  return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
+    const lower = String(token).toLowerCase();
+    if (lower[0] === "#") {
+      const hex = lower[1] === "x";
+      const code = Number.parseInt(lower.slice(hex ? 2 : 1), hex ? 16 : 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : " ";
+    }
+    return Object.prototype.hasOwnProperty.call(named, lower) ? named[lower] : `&${token};`;
+  });
+}
+
+function cleanHTMLTextV35(value) {
+  return decodeHTMLTextV35(value).replace(/\s+/g, " ").trim();
+}
+
+function parseHTMLAttributesV35(raw) {
+  const out = Object.create(null);
+  const source = String(raw || "");
+  const pattern = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = pattern.exec(source))) {
+    const key = String(match[1] || "").toLowerCase();
+    if (!key) continue;
+    out[key] = decodeHTMLTextV35(match[2] ?? match[3] ?? match[4] ?? "");
+  }
+  return out;
+}
+
+function absoluteURLV35(href, baseURL) {
+  if (!href) return null;
+  try { return new URL(href, baseURL).toString(); } catch { return null; }
+}
+
+function queryValueV35(href, names, baseURL) {
+  if (!href) return null;
+  try {
+    const u = new URL(href, baseURL);
+    for (const name of names) {
+      const value = u.searchParams.get(name);
+      if (value) return cleanHTMLTextV35(value);
+    }
+  } catch {}
+  return null;
+}
+
+function parseStopHTMLFastV35(entry, limit, liveOnly) {
+  const stopId = String(entry?.stopId || "");
+  const html = String(entry?.html || "");
+  const baseURL = `https://136213.mobi/RealTime/RealTimeStopResults.aspx?SN=${encodeURIComponent(stopId)}`;
+  const stack = [];
+  const completedRows = [];
+  const headingBuffers = [];
+  const bodyParts = [];
+  let currentRow = null;
+  let headingSerial = 0;
+
+  const finaliseRow = () => {
+    if (!currentRow) return;
+    completedRows.push(currentRow);
+    currentRow = null;
+  };
+
+  const tokens = html.match(/<!--[\s\S]*?-->|<![^>]*>|<\/?[A-Za-z][^>]*>|[^<]+/g) || [];
+  for (const token of tokens) {
+    if (!token.startsWith("<")) {
+      const top = stack[stack.length - 1];
+      if (top?.suppressed) continue;
+      const text = decodeHTMLTextV35(token);
+      if (!text.trim()) continue;
+      bodyParts.push(text);
+      if (currentRow) {
+        currentRow.textParts.push(text);
+        if (top?.inRouteDisplayName && top?.inStrong) currentRow.routeStrongParts.push(text);
+      }
+      if (Number.isInteger(top?.headingIndex)) headingBuffers[top.headingIndex]?.parts.push(text);
+      continue;
+    }
+    if (/^<!--|^<![^-]/.test(token)) continue;
+
+    const closing = /^<\//.test(token);
+    const nameMatch = token.match(/^<\/?\s*([A-Za-z0-9:-]+)/);
+    if (!nameMatch) continue;
+    const tag = nameMatch[1].toLowerCase();
+
+    if (closing) {
+      let ctx = null;
+      while (stack.length) {
+        const candidate = stack.pop();
+        if (candidate?.tag === tag) { ctx = candidate; break; }
+      }
+      if (ctx?.headingRoot && Number.isInteger(ctx.headingIndex)) {
+        headingBuffers[ctx.headingIndex].closed = true;
+      }
+      if (ctx?.rowRoot) finaliseRow();
+      continue;
+    }
+
+    const rawAttrs = token
+      .replace(/^<\s*[A-Za-z0-9:-]+/, "")
+      .replace(/\/?>\s*$/, "");
+    const attrs = parseHTMLAttributesV35(rawAttrs);
+    const classes = new Set(String(attrs.class || "").split(/\s+/).filter(Boolean));
+    const parent = stack[stack.length - 1] || null;
+    const headingRoot = tag === "h1" || tag === "h2" || classes.has("stop-name") || classes.has("page-title");
+    const headingIndex = headingRoot
+      ? headingSerial++
+      : (Number.isInteger(parent?.headingIndex) ? parent.headingIndex : null);
+    if (headingRoot) headingBuffers[headingIndex] = { parts: [], closed: false };
+
+    const ctx = {
+      tag,
+      suppressed: Boolean(parent?.suppressed || tag === "script" || tag === "style" || tag === "noscript"),
+      inRouteDisplayName: Boolean(parent?.inRouteDisplayName || classes.has("route-display-name")),
+      inStrong: Boolean(parent?.inStrong || tag === "strong"),
+      headingRoot,
+      headingIndex,
+      rowRoot: false
+    };
+
+    if (!currentRow && classes.has("tpm_row_timetable")) {
+      currentRow = {
+        attrs,
+        classes,
+        textParts: [],
+        routeStrongParts: [],
+        links: []
+      };
+      ctx.rowRoot = true;
+    }
+    if (currentRow && tag === "a" && attrs.href) currentRow.links.push(attrs.href);
+    stack.push(ctx);
+
+    const selfClosing = /\/\s*>$/.test(token) || ["br", "img", "meta", "link", "input", "hr"].includes(tag);
+    if (selfClosing) {
+      const popped = stack.pop();
+      if (popped?.headingRoot && Number.isInteger(popped.headingIndex)) headingBuffers[popped.headingIndex].closed = true;
+      if (popped?.rowRoot) finaliseRow();
+    }
+  }
+  finaliseRow();
+
+  const bodyText = cleanHTMLTextV35(bodyParts.join(" "));
+  const stopName = headingBuffers
+    .map(row => cleanHTMLTextV35(row?.parts?.join(" ") || ""))
+    .find(Boolean) || null;
+  const explicitEmpty = /\bno\s+more\s+services\s+scheduled\b|\bno\s+(?:live\s+|real[- ]?time\s+|upcoming\s+)?(?:services|departures|results)\b|\bthere\s+are\s+no\b/i.test(bodyText);
+  const pageIdentifiesStop = new RegExp(`(?:Depart\\s+from\\s+stop|Results\\s+for\\s+Stop)\\s*${stopId}\\b`, "i").test(bodyText);
+  const helpMarker = /5\s+departure\s+times\s+will\s+be\s+displayed|times\s+are\s+approximate\s+scheduled\s+times/i.test(bodyText);
+  const errorPage = /access\s+denied|captcha|temporarily\s+unavailable|application\s+error|server\s+error|request\s+blocked/i.test(bodyText);
+  const authoritativeEmpty = Boolean(
+    ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 && completedRows.length === 0 && !errorPage &&
+    pageIdentifiesStop && (explicitEmpty || helpMarker)
+  );
+
+  const allServices = completedRows.map(row => {
+    const text = cleanHTMLTextV35(row.textParts.join(" "));
+    if (!text) return null;
+    const detailHref = row.links.find(href => /RealTimeFleetTrip|fleet=/i.test(href || "")) || null;
+    const detailURL = absoluteURLV35(detailHref, baseURL);
+    const route =
+      cleanHTMLTextV35(row.attrs["data-route"]) ||
+      text.match(/\b([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT|Ferry|Airport Line|Armadale Line|Ellenbrook Line|Fremantle Line|Mandurah Line|Midland Line|Thornlie-Cockburn Line|Yanchep Line)\b/i)?.[1] ||
+      null;
+    const destination =
+      cleanHTMLTextV35(row.routeStrongParts.join(" ")) ||
+      cleanHTMLTextV35(row.attrs["data-destination"]) ||
+      text.match(/To\s+.+?(?=\s+Depart from stop|\s+\d+\s*MIN|\s+\(sched|$)/i)?.[0]?.trim() ||
+      null;
+    const fleet =
+      cleanHTMLTextV35(row.attrs["data-fleet"]) ||
+      queryValueV35(detailHref, ["fleet", "fleetNumber", "vehicle"], baseURL) ||
+      text.match(/\bFleet\s*#?\s*(\d{3,5})\b/i)?.[1] ||
+      null;
+    const tripId =
+      cleanHTMLTextV35(row.attrs["data-tripid"]) ||
+      cleanHTMLTextV35(row.attrs["data-trip-id"]) ||
+      queryValueV35(detailHref, ["tripId", "tripID", "trip", "t"], baseURL) ||
+      null;
+    const runNumber =
+      cleanHTMLTextV35(row.attrs["data-run"]) ||
+      text.match(/\b(?:Run|Service)\s*#?\s*([A-Z0-9-]{2,12})\b/i)?.[1] ||
+      null;
+    const platform =
+      cleanHTMLTextV35(row.attrs["data-platform"]) ||
+      text.match(/\bPlatform\s*([0-9]+[A-Z]?)\b/i)?.[1] ||
+      null;
+    const scheduled = /\(sched\.?\)|\bscheduled\b/i.test(text);
+    const isLive = !scheduled && (
+      row.classes.has("fleet-running") || row.classes.has("live") || Boolean(fleet) ||
+      /\bLIVE\b|\barriving\b|\bdeparting\b/i.test(text)
+    );
+    const due =
+      text.match(/\b\d+\s*MIN\b/i)?.[0]?.replace(/\s+/g, " ").toUpperCase() ||
+      (/\bNOW\b/i.test(text) ? "NOW" : (/\barriving\b/i.test(text) ? "Arriving" : null));
+    const dueMinutesMatch = due?.match(/\d+/);
+    const minutesUntilDeparture = dueMinutesMatch ? Number(dueMinutesMatch[0]) : ((due === "Arriving" || due === "NOW") ? 0 : null);
+    const time = text.match(/\b\d{1,2}[:.]\d{2}\s*(?:am|pm)\b/i)?.[0]?.replace(/\s+/g, "") || null;
+    return {
+      route: route ? cleanHTMLTextV35(route) : null,
+      destination: destination ? cleanHTMLTextV35(destination) : null,
+      stopText: "Depart from stop",
+      stopId,
+      due,
+      dueText: due,
+      minutesUntilDeparture,
+      time,
+      departureTime: time,
+      liveTime: isLive ? time : null,
+      statusText: isLive ? "Live" : "Scheduled",
+      scheduled,
+      live: isLive,
+      workerLive: isLive,
+      workerMobiBoardRow: true,
+      workerMobiLiveRow: isLive,
+      workerMobiScheduledRow: !isLive,
+      fleetNumber: fleet,
+      fleet,
+      tripId,
+      runNumber,
+      platform,
+      detailURL: detailURL || (fleet
+        ? `https://136213.mobi/RealTime/RealTimeFleetTrip.aspx?nq=true&fleet=${encodeURIComponent(fleet)}`
+        : null),
+      rawText: text.slice(0, 420)
+    };
+  }).filter(service => service && service.route && service.destination);
+
+  const services = (liveOnly ? allServices.filter(service => service.live === true) : allServices).slice(0, limit);
+  return {
+    stopId,
+    stopName: stopName || `Stop ${stopId}`,
+    services,
+    rawRowCount: allServices.length,
+    liveRowCount: allServices.filter(service => service.live === true).length,
+    explicitEmpty,
+    authoritativeEmpty,
+    validStopPage: pageIdentifiesStop && !errorPage,
+    hasTimetableMarkup: completedRows.length > 0
+  };
+}
+
+function parseStopHTMLBatchFastV35(items, limit, liveOnly) {
+  const list = Array.isArray(items) ? items.filter(item => item?.ok && item?.html) : [];
+  const startedAt = Date.now();
+  const parsed = list.map(entry => parseStopHTMLFastV35(entry, limit, liveOnly));
+  stats.atomicFastParserDocumentsV35 += parsed.length;
+  stats.atomicVerifiedEmptyComponentsV35 += parsed.filter(row => row.authoritativeEmpty === true).length;
+  parsed.fastParserMsV35 = Date.now() - startedAt;
+  return parsed;
+}
+
+function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const request = https.get(targetURL, {
+      agent: ATOMIC_NATIVE_AGENT_V35,
+      headers: {
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "User-Agent": "Hubway-Render/3.5-All-ID-Native-Multiplex"
+      }
+    }, response => {
+      const status = Number(response.statusCode || 0);
+      const location = response.headers.location;
+      if ([301, 302, 303, 307, 308].includes(status) && location && redirectsLeft > 0) {
+        response.resume();
+        let redirected = null;
+        try { redirected = new URL(location, targetURL).toString(); } catch {}
+        if (!redirected) return finish({ ok: false, status, html: "", error: "Invalid redirect" });
+        void nativeHTTPSGetV35(redirected, timeoutMs, redirectsLeft - 1).then(finish);
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      response.on("data", chunk => {
+        bytes += chunk.length;
+        if (bytes > ATOMIC_COMPONENT_MAX_HTML_BYTES) {
+          request.destroy(new Error("MOBI response too large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => {
+        const html = Buffer.concat(chunks).toString("utf8");
+        const ok = status >= 200 && status < 400 && /<html|<!doctype/i.test(html);
+        finish({ ok, status, html: ok ? html : "", error: ok ? null : `MOBI HTTP ${status}` });
+      });
+      response.on("error", error => finish({ ok: false, status, html: "", error: String(error?.message || error) }));
+    });
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("native-stop-timeout")));
+    request.on("error", error => finish({ ok: false, status: 0, html: "", error: String(error?.message || error) }));
+  });
+}
+
+async function fetchStopHTMLNativeV35(stopId) {
+  stats.atomicNativeHTTPFetchesV35 += 1;
+  const startedAt = Date.now();
+  const requestURL = new URL(stopUrl(stopId));
+  requestURL.searchParams.set("_hubwayNative", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const response = await nativeHTTPSGetV35(requestURL.toString(), ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35);
+  if (response.ok) stats.atomicNativeHTTPSuccessesV35 += 1;
+  else stats.atomicNativeHTTPErrorsV35 += 1;
+  return { stopId: String(stopId), ...response, ms: Date.now() - startedAt, transportV35: "native-https" };
+}
+
 // v3.3: fetch every component through BrowserContext.request, which shares the
 // MOBI cookie/session jar with Chromium but does not allocate one page per stop.
 // One existing Chromium page parses the returned HTML in bounded chunks. Only
@@ -1530,7 +1871,7 @@ async function fetchStopHTMLDirectV32(stopId) {
   requestURL.searchParams.set("_hubwayAtomic", String(Date.now()));
   try {
     const response = await context.request.get(requestURL.toString(), {
-      timeout: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS,
+      timeout: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35,
       failOnStatusCode: false,
       headers: {
         "Accept": "text/html,application/xhtml+xml",
@@ -1723,7 +2064,7 @@ async function parseStopHTMLBatchV32(items, limit, liveOnly) {
   }
 }
 
-async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
+async function buildAtomicComponentBatchV35(stopIds, perStop, options = {}) {
   const startedAt = Date.now();
   const liveOnly = options.liveOnly !== false;
   const forceRefresh = options.forceRefresh !== false;
@@ -1735,6 +2076,7 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
   );
   const preferFreshComponentCache = options.preferFreshComponentCache !== false;
   const allowStaleComponentRescue = options.allowStaleComponentRescue !== false;
+  const allowPageFallback = options.allowPageFallback === true || ATOMIC_FOREGROUND_PAGE_FALLBACK_V35;
   const resultByStop = new Map();
   const fetchedAt = new Date().toISOString();
   let directFetchMs = 0;
@@ -1796,14 +2138,17 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
     const direct = await mapLimit(
       roundIds,
       directConcurrency,
-      stopId => fetchStopHTMLDirectV32(stopId)
+      stopId => round === 0
+        ? fetchStopHTMLNativeV35(stopId)
+        : fetchStopHTMLDirectV32(stopId)
     );
+    if (round > 0) stats.atomicContextRetryFetchesV35 += direct.length;
     directFetchMs += Date.now() - fetchStartedAt;
     directAttemptCount += direct.length;
     if (round > 0) stats.atomicComponentHTTPRetryFetchesV33 += direct.length;
 
     const parseStartedAt = Date.now();
-    const parsed = await parseStopHTMLBatchV32(direct, perStop, liveOnly);
+    const parsed = parseStopHTMLBatchFastV35(direct, perStop, liveOnly);
     directParseMs += Date.now() - parseStartedAt;
     const parsedByStop = new Map(parsed.map(row => [String(row.stopId), row]));
     const directByStop = new Map(direct.map(row => [String(row.stopId), row]));
@@ -1814,7 +2159,7 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
       const directRow = directByStop.get(String(stopId));
       const directUsable = Boolean(
         directRow?.ok && parsedRow &&
-        (parsedRow.hasTimetableMarkup || parsedRow.explicitEmpty)
+        (parsedRow.hasTimetableMarkup || parsedRow.authoritativeEmpty === true)
       );
       if (!directUsable) {
         nextUnresolved.push(String(stopId));
@@ -1831,8 +2176,8 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
         stopId: String(stopId),
         stopName: parsedRow.stopName || `Stop ${stopId}`,
         source: round > 0
-          ? "136213-browser-v3.4-all-ids-concurrent-http-retry"
-          : "136213-browser-v3.4-all-ids-concurrent-http",
+          ? "136213-browser-v3.5-all-ids-context-retry"
+          : "136213-browser-v3.5-all-ids-native-http",
         freshLive: forceRefresh,
         liveOnly,
         rawRowCount: parsedRow.rawRowCount,
@@ -1858,7 +2203,7 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
         cache: { hit: false, directHTTP: true },
         directHTTP: true,
         directAttempt: round + 1,
-        authoritativeEmptyBoard: services.length === 0 && parsedRow.explicitEmpty === true,
+        authoritativeEmptyBoard: services.length === 0 && parsedRow.authoritativeEmpty === true,
         ms: Number(directRow?.ms || 0)
       });
     }
@@ -1877,7 +2222,8 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
   }
 
   let fallbackMs = 0;
-  const fallbackIds = unresolvedIds.slice();
+  const fallbackIds = allowPageFallback ? unresolvedIds.slice() : [];
+  if (!allowPageFallback && unresolvedIds.length) stats.atomicPageFallbacksSkippedV35 += unresolvedIds.length;
   if (fallbackIds.length) {
     stats.atomicComponentHTTPFallbacksV32 += fallbackIds.length;
     const fallbackStartedAt = Date.now();
@@ -1903,7 +2249,7 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
     stopId: String(stopId),
     ok: false,
     stopName: `Stop ${stopId}`,
-    source: "136213-browser-v3.4-all-ids-component-missing",
+    source: "136213-browser-v3.5-all-ids-component-missing",
     count: 0,
     services: [],
     error: "Component did not complete"
@@ -1920,13 +2266,17 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
   return {
     ok: complete,
     source: complete
-      ? "136213-browser-v3.4-all-ids-concurrent-complete"
-      : "136213-browser-v3.4-all-ids-concurrent-partial",
+      ? "136213-browser-v3.5-all-ids-native-multiplex-complete"
+      : "136213-browser-v3.5-all-ids-native-multiplex-partial",
     componentSnapshots: true,
     atomicBoard: true,
     sharedSessionHTTPV32: true,
     allComponentIDsOneRequestV33: true,
     allIDsConcurrentV34: true,
+    nativeHTTPMultiplexV35: true,
+    fastNodeHTMLParserV35: true,
+    verifiedEmptyAcceptedV35: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35,
+    foregroundPageFallbackV35: allowPageFallback,
     upstreamSingleStopEndpointV34: true,
     upstreamRequestsIssuedTogetherV34: true,
     upstreamRequestCountV34: stopIds.length - freshComponentCacheHitCount,
@@ -1954,6 +2304,8 @@ async function buildAtomicComponentBatchV34(stopIds, perStop, options = {}) {
       requestTotalMs: Date.now() - startedAt,
       directFetchMs,
       directParseMs,
+      nativeHTTPTimeoutMsV35: ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35,
+      contextRetryTimeoutMsV35: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35,
       fallbackMs,
       directHTTPCount: stopIds.length - fallbackIds.length - freshComponentCacheHitCount,
       pageFallbackCount: fallbackIds.length,
@@ -1986,8 +2338,9 @@ app.get([
   const preferFreshComponentCache = String(req.query.preferFreshComponentCache || "1") !== "0";
   const allowStaleComponentRescue = String(req.query.allowStaleComponentRescue || "1") !== "0";
   const maxAgeMs = positiveInt(req.query.maxAgeMs, 12000, 0, 120000);
+  const allowPageFallback = String(req.query.allowPageFallback || "0") === "1";
   const stableIds = stopIds.slice().sort((a, b) => Number(a) - Number(b));
-  const aggregateKey = `atomic-v34|${stableIds.join(",")}|${perStop}|${liveOnly ? 1 : 0}`;
+  const aggregateKey = `atomic-v35|${stableIds.join(",")}|${perStop}|${liveOnly ? 1 : 0}`;
 
   if (!forceAggregateRefresh) {
     const cached = getBatchCache(aggregateKey, false);
@@ -1996,10 +2349,14 @@ app.get([
       res.set("Cache-Control", "no-store");
       return res.status(200).json({
         ...cached.payload,
-        source: "136213-browser-v3.4-all-ids-aggregate-cache",
+        source: "136213-browser-v3.5-all-ids-aggregate-cache",
         aggregateCacheHitV34: true,
         aggregateCacheAgeMsV34: cached.ageMs,
         allIDsConcurrentV34: true,
+        nativeHTTPMultiplexV35: true,
+        fastNodeHTMLParserV35: true,
+        verifiedEmptyAcceptedV35: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35,
+        foregroundPageFallbackV35: false,
         upstreamRequestsIssuedTogetherV34: true,
         upstreamRequestCountV34: 0,
         upstreamFetchWaveCountV34: 0,
@@ -2014,12 +2371,13 @@ app.get([
   if (promise) {
     stats.atomicComponentBatchCoalescedV32 += 1;
   } else {
-    promise = buildAtomicComponentBatchV34(stopIds, perStop, {
+    promise = buildAtomicComponentBatchV35(stopIds, perStop, {
       liveOnly,
       forceRefresh,
       retryRounds,
       preferFreshComponentCache,
-      allowStaleComponentRescue
+      allowStaleComponentRescue,
+      allowPageFallback
     }).finally(() => {
       if (atomicComponentBatchInFlightV32.get(key) === promise) {
         atomicComponentBatchInFlightV32.delete(key);
@@ -2036,9 +2394,11 @@ app.get([
     stats.batchErrors += 1;
     return res.status(504).json({
       ok: false,
-      source: "136213-browser-v3.4-all-ids-concurrent-error",
+      source: "136213-browser-v3.5-all-ids-native-multiplex-error",
       atomicBoard: true,
       allIDsConcurrentV34: true,
+      nativeHTTPMultiplexV35: true,
+      fastNodeHTMLParserV35: true,
       stopIds,
       perStop,
       error: String(error?.message || error),
