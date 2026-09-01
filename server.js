@@ -43,8 +43,6 @@ const ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 = String(process.env.ATOMIC_ACCEPT_VERIFI
 const ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 = String(process.env.ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 || "0") === "1";
 const ATOMIC_NATIVE_AGENT_V35 = new https.Agent({
   keepAlive: true,
-  // v3.6 pressure governor: never fan a large interchange out as dozens of
-  // simultaneous origin connections. This cap is process-wide for native MOBI.
   maxSockets: 3,
   maxFreeSockets: 3,
   scheduling: "lifo",
@@ -68,10 +66,6 @@ const WORKER_BASE_URL = String(
 ).trim().replace(/\/$/, "");
 const SERVICE_WARM_MAX_FLEETS = positiveInt(process.env.SERVICE_WARM_MAX_FLEETS, 12, 1, 24);
 const SERVICE_WARM_CONCURRENCY = positiveInt(process.env.SERVICE_WARM_CONCURRENCY, 2, 1, 4);
-// v2.5: a complete selected-service packet can legitimately take longer than
-// nine seconds when the Worker must resolve both the stop sequence and map line.
-// This work is background-only, so reliability is more important than a short
-// orchestration timeout.
 const SERVICE_WARM_TIMEOUT_MS = positiveInt(process.env.SERVICE_WARM_TIMEOUT_MS, 30000, 5000, 45000);
 const SERVICE_WARM_RECENT_MS = positiveInt(process.env.SERVICE_WARM_RECENT_MS, 45000, 5000, 300000);
 const SERVICE_WARM_FAILED_RECENT_MS = positiveInt(process.env.SERVICE_WARM_FAILED_RECENT_MS, 2000, 500, 10000);
@@ -93,9 +87,6 @@ const inFlight = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
 const atomicComponentBatchInFlightV32 = new Map();
-// v3.3: service rows are never reused for strict-fresh requests. This map stores
-// only which component stop IDs recently produced live rows, so a large grouped
-// stop can scan the most promising stands first without returning stale times.
 const groupedStopHotness = new Map();
 const groupedSnapshotGeneration = new Map();
 const serviceWarmPending = [];
@@ -307,8 +298,6 @@ function pumpServiceWarmQueue() {
         };
         serviceWarmRecent.set(key, {
           result,
-          // v2.5: do not suppress an immediate retry for ten seconds after a
-          // transient Worker/R2 timeout.
           expiresAt: Date.now() + SERVICE_WARM_FAILED_RECENT_MS
         });
         job.resolve(result);
@@ -1542,13 +1531,10 @@ app.get("/health", async (req, res) => {
 
 
 
-// v3.5: the first grouped-stop wave uses Node's native HTTPS stack with one
-// keep-alive agent. This avoids BrowserContext.request and DOMParser overhead
-// for the normal path while still issuing every component stop at the same time.
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "â€“", mdash: "â€”", hellip: "â€¦"
+    ndash: "Ã¢â‚¬â€œ", mdash: "Ã¢â‚¬â€", hellip: "Ã¢â‚¬Â¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -1858,25 +1844,16 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
 async function fetchStopHTMLNativeV35(stopId) {
   stats.atomicNativeHTTPFetchesV35 += 1;
   const startedAt = Date.now();
-  // v3.6: use the canonical stop URL. The old per-request _hubwayNative cache
-  // buster made every fetch unique at the origin and defeated any harmless
-  // upstream caching/coalescing.
   const response = await nativeHTTPSGetV35(stopUrl(stopId), ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35);
   if (response.ok) stats.atomicNativeHTTPSuccessesV35 += 1;
   else stats.atomicNativeHTTPErrorsV35 += 1;
   return { stopId: String(stopId), ...response, ms: Date.now() - startedAt, transportV35: "native-https" };
 }
 
-// v3.3: fetch every component through BrowserContext.request, which shares the
-// MOBI cookie/session jar with Chromium but does not allocate one page per stop.
-// One existing Chromium page parses the returned HTML in bounded chunks. Only
-// ambiguous/failed documents fall back to normal page navigation.
 async function fetchStopHTMLDirectV32(stopId) {
   await ensureBrowser();
   stats.atomicComponentHTTPFetchesV32 += 1;
   const startedAt = Date.now();
-  // v3.6: keep the BrowserContext request on the same canonical URL as a real
-  // navigation instead of appending an automation-specific cache buster.
   try {
     const response = await context.request.get(stopUrl(stopId), {
       timeout: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35,
@@ -2415,10 +2392,6 @@ app.get([
   }
 });
 
-// v3.4: bounded per-component refresh endpoint. The Worker uses this only for
-// missing/stale component stop snapshots, so a 29-stop group no longer needs a
-// fresh 29-stop browser rebuild on every open. fetchStopShared already coalesces
-// overlapping requests for the same stop ID and the page pool remains capped.
 app.get("/live-stop-components", async (req, res) => {
   stats.requests += 1;
   stats.componentBatchRequests += 1;
