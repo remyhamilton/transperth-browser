@@ -1,117 +1,123 @@
 services:
-  - type: web
-    name: transperth-browser
-    runtime: node
-    plan: standard
-    buildCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm ci --no-audit --no-fund && PLAYWRIGHT_BROWSERS_PATH=0 npx --no-install playwright install chromium
-    startCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm start
-    healthCheckPath: /health
-    autoDeployTrigger: commit
-    envVars:
-      - key: BROWSER_TOKEN
-        sync: false
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
-      - key: BROWSER_POOL_SIZE
-        value: "2"
-      - key: NAVIGATION_TIMEOUT_MS
-        value: "12000"
-      - key: ROW_WAIT_TIMEOUT_MS
-        value: "6500"
-      - key: LIVE_ROW_WAIT_TIMEOUT_MS
-        value: "1800"
-      - key: LIVE_SETTLE_MS
-        value: "80"
-      - key: BLOCK_STYLESHEETS
-        value: "1"
-      - key: QUEUE_TIMEOUT_MS
-        value: "7000"
-      - key: FRESH_CACHE_MS
-        value: "120000"
-      - key: STALE_CACHE_MS
-        value: "900000"
-      - key: MAX_CACHE_ENTRIES
-        value: "160"
-      - key: BATCH_MAX_STOPS
-        value: "60"
-      - key: BATCH_ROW_WAIT_TIMEOUT_MS
-        value: "900"
-      - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
-        value: "3"
-      - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
-        value: "2600"
-      - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
-        value: "0"
-      - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
-        value: "250"
-      - key: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
-        value: "1"
-      - key: ATOMIC_COMPONENT_PARSE_CHUNK
-        value: "60"
-      - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
-        value: "1500000"
-      - key: ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35
-        value: "4200"
-      - key: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35
-        value: "2600"
-      - key: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35
-        value: "1"
-      - key: ATOMIC_FOREGROUND_PAGE_FALLBACK_V35
-        value: "0"
-      - key: BATCH_FRESH_CACHE_MS
-        value: "120000"
-      - key: BATCH_STALE_CACHE_MS
-        value: "900000"
-      - key: BATCH_CACHE_MAX_ENTRIES
-        value: "32"
-      - key: BATCH_KEEP_WARM_MS
-        value: "300000"
-      - key: BATCH_REFRESH_INTERVAL_MS
-        value: "120000"
-      - key: BATCH_REFRESH_LEAD_MS
-        value: "20000"
-      - key: BATCH_REFRESH_MAX_PER_TICK
-        value: "1"
-      - key: BATCH_BACKGROUND_REFRESH_ENABLED
-        value: "0"
-      - key: PREWARM_KNOWN_GROUPS
-        value: "0"
-      - key: PAGE_MAX_USES
-        value: "60"
-      - key: MEMORY_CHECK_INTERVAL_MS
-        value: "60000"
-      - key: HEAP_SOFT_LIMIT_MB
-        value: "650"
-      - key: SERVICE_WARM_RECENT_MAX_ENTRIES
-        value: "256"
-      - key: SJP_BASE_URL
-        value: "https://realtime.transperth.info"
-      - key: SJP_AUTHORIZATION
-        sync: false
-      - key: SJP_AV
-        value: "2.12.3"
-      - key: SJP_RV
-        value: "Pi2123.1x"
-      - key: SJP_USER_AGENT
-        value: "Transperth/132426 CFNetwork/3860.700.1 Darwin/25.6.0"
-      - key: SJP_TIMEOUT_MS
-        value: "4500"
-      - key: SJP_GROUP_CONCURRENCY
-        value: "3"
-      - key: SJP_CACHE_MS
-        value: "15000"
-      - key: WORKER_BASE_URL
-        value: "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
-      - key: SERVICE_WARM_MAX_FLEETS
-        value: "12"
-      - key: SERVICE_WARM_CONCURRENCY
-        value: "2"
-      - key: SERVICE_WARM_TIMEOUT_MS
-        value: "30000"
-      - key: SERVICE_WARM_FAILED_RECENT_MS
-        value: "2000"
-      - key: SERVICE_WARM_RECENT_MS
-        value: "45000"
-      - key: SERVICE_WARM_QUEUE_MAX
-        value: "80"
-
+- type: web
+  name: transperth-browser
+  runtime: node
+  plan: standard
+  buildCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm ci --no-audit --no-fund && PLAYWRIGHT_BROWSERS_PATH=0
+    npx --no-install playwright install chromium
+  startCommand: PLAYWRIGHT_BROWSERS_PATH=0 npm start
+  healthCheckPath: /health
+  autoDeployTrigger: commit
+  envVars:
+  - key: BROWSER_TOKEN
+    sync: false
+  - key: PLAYWRIGHT_BROWSERS_PATH
+    value: '0'
+  - key: BROWSER_POOL_SIZE
+    value: '2'
+  - key: NAVIGATION_TIMEOUT_MS
+    value: '12000'
+  - key: ROW_WAIT_TIMEOUT_MS
+    value: '6500'
+  - key: LIVE_ROW_WAIT_TIMEOUT_MS
+    value: '1800'
+  - key: LIVE_SETTLE_MS
+    value: '80'
+  - key: BLOCK_STYLESHEETS
+    value: '1'
+  - key: QUEUE_TIMEOUT_MS
+    value: '7000'
+  - key: FRESH_CACHE_MS
+    value: '120000'
+  - key: STALE_CACHE_MS
+    value: '900000'
+  - key: MAX_CACHE_ENTRIES
+    value: '160'
+  - key: BATCH_MAX_STOPS
+    value: '60'
+  - key: BATCH_ROW_WAIT_TIMEOUT_MS
+    value: '900'
+  - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
+    value: '3'
+  - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
+    value: '2600'
+  - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
+    value: '0'
+  - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
+    value: '250'
+  - key: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
+    value: '1'
+  - key: ATOMIC_COMPONENT_PARSE_CHUNK
+    value: '60'
+  - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
+    value: '1500000'
+  - key: ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35
+    value: '4200'
+  - key: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35
+    value: '2600'
+  - key: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35
+    value: '1'
+  - key: ATOMIC_FOREGROUND_PAGE_FALLBACK_V35
+    value: '0'
+  - key: BATCH_FRESH_CACHE_MS
+    value: '120000'
+  - key: BATCH_STALE_CACHE_MS
+    value: '900000'
+  - key: BATCH_CACHE_MAX_ENTRIES
+    value: '32'
+  - key: BATCH_KEEP_WARM_MS
+    value: '300000'
+  - key: BATCH_REFRESH_INTERVAL_MS
+    value: '120000'
+  - key: BATCH_REFRESH_LEAD_MS
+    value: '20000'
+  - key: BATCH_REFRESH_MAX_PER_TICK
+    value: '1'
+  - key: BATCH_BACKGROUND_REFRESH_ENABLED
+    value: '0'
+  - key: PREWARM_KNOWN_GROUPS
+    value: '0'
+  - key: PAGE_MAX_USES
+    value: '60'
+  - key: MEMORY_CHECK_INTERVAL_MS
+    value: '60000'
+  - key: HEAP_SOFT_LIMIT_MB
+    value: '650'
+  - key: SERVICE_WARM_RECENT_MAX_ENTRIES
+    value: '256'
+  - key: SJP_BASE_URL
+    value: https://realtime.transperth.info
+  - key: SJP_CAPTURE_TOKEN
+    sync: false
+  - key: SJP_CAPTURE_TTL_MS
+    value: '120000'
+  - key: SJP_CAPTURE_MAX_STOPS
+    value: '160'
+  - key: SJP_CAPTURE_MAX_TRIPS
+    value: '320'
+  - key: SJP_AV
+    value: 2.12.3
+  - key: SJP_RV
+    value: Pi2123.1x
+  - key: SJP_USER_AGENT
+    value: Transperth/132426 CFNetwork/3860.700.1 Darwin/25.6.0
+  - key: SJP_TIMEOUT_MS
+    value: '4500'
+  - key: SJP_GROUP_CONCURRENCY
+    value: '3'
+  - key: SJP_CACHE_MS
+    value: '15000'
+  - key: WORKER_BASE_URL
+    value: https://twilight-wildflower-4e89.remy-hamilton.workers.dev
+  - key: SERVICE_WARM_MAX_FLEETS
+    value: '12'
+  - key: SERVICE_WARM_CONCURRENCY
+    value: '2'
+  - key: SERVICE_WARM_TIMEOUT_MS
+    value: '30000'
+  - key: SERVICE_WARM_FAILED_RECENT_MS
+    value: '2000'
+  - key: SERVICE_WARM_RECENT_MS
+    value: '45000'
+  - key: SERVICE_WARM_QUEUE_MAX
+    value: '80'
