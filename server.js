@@ -193,7 +193,9 @@ const stats = {
   sjpCaptureTripPublishesV2252: 0,
   sjpCaptureReadHitsV2252: 0,
   sjpCaptureExpiredV2252: 0,
-  sjpCaptureRejectedV2252: 0
+  sjpCaptureRejectedV2252: 0,
+  sjpCandidateBoardReadsV2254: 0,
+  sjpCandidateOfficialGroupBoardsV2254: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -773,6 +775,57 @@ function capturedSJPStopV2252(stopId, maxAgeMs = SJP_CAPTURE_TTL_MS_V2252) {
     captureAgeMs: ageMs,
     cache: { hit: true, kind: "mitm-capture-v2252", ageMs }
   };
+}
+
+function capturedSJPCandidateBoardsV2254(excludedStopIds = [], maxAgeMs = SJP_CAPTURE_TTL_MS_V2252) {
+  pruneSJPCaptureV2252();
+  const excluded = new Set((Array.isArray(excludedStopIds) ? excludedStopIds : [excludedStopIds])
+    .map(value => String(value || "").trim())
+    .filter(Boolean));
+  const ageLimit = Math.min(
+    SJP_CAPTURE_TTL_MS_V2252,
+    Math.max(1000, Number(maxAgeMs) || SJP_CAPTURE_TTL_MS_V2252)
+  );
+  const now = Date.now();
+  const boards = [];
+  for (const [stopId, entry] of sjpCapturedStopsV2252) {
+    if (!entry || excluded.has(String(stopId))) continue;
+    const ageMs = Math.max(0, now - Number(entry.createdAt || 0));
+    if (ageMs > ageLimit) continue;
+    const payload = entry.payload;
+    if (!payload || payload.ok !== true) continue;
+    const services = Array.isArray(payload.services) ? payload.services : [];
+    const busServices = services.filter(service => /^(?:bus|school bus)$/i.test(String(service?.mode || "Bus").trim()));
+    if (!busServices.length) continue;
+    const requestedStop = payload.requestedStop || null;
+    const description = String(requestedStop?.Description || payload.stopName || `Stop ${stopId}`).trim();
+    const supportedModes = String(requestedStop?.SupportedModes || "").trim();
+    const likelyOfficialGroup = String(stopId).length <= 4 ||
+      /\b(?:station|stn|busport|bus station|interchange|terminal)\b/i.test(description);
+    boards.push({
+      ok: true,
+      stopId: String(stopId),
+      stopUid: String(payload.stopUid || `PerthRestricted:${stopId}`),
+      stopName: description,
+      requestedStop,
+      supportedModes: supportedModes || null,
+      likelyOfficialGroupV2254: likelyOfficialGroup,
+      count: busServices.length,
+      liveCount: busServices.filter(service => service?.live === true).length,
+      scheduledCount: busServices.filter(service => service?.live !== true).length,
+      captureAgeMs: ageMs,
+      capturedAt: payload.capturedAt || null,
+      services: busServices.map(service => ({ ...service })),
+      source: "transperth-sjp-candidate-official-board-v2254"
+    });
+  }
+  boards.sort((a, b) => {
+    if (a.likelyOfficialGroupV2254 !== b.likelyOfficialGroupV2254) return a.likelyOfficialGroupV2254 ? -1 : 1;
+    return Number(a.captureAgeMs || 0) - Number(b.captureAgeMs || 0);
+  });
+  stats.sjpCandidateBoardReadsV2254 += 1;
+  stats.sjpCandidateOfficialGroupBoardsV2254 += boards.filter(board => board.likelyOfficialGroupV2254).length;
+  return boards.slice(0, 16);
 }
 
 function capturedSJPTripV2252(tripId, maxAgeMs = SJP_CAPTURE_TTL_MS_V2252) {
@@ -1945,7 +1998,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.8-sjp-board-v2253",
+    service: "transperth-browser-v3.9-sjp-official-groups-v2254",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1964,7 +2017,7 @@ app.get("/", (req, res) => {
       "/health",
       "POST /capture/sjp (SJP_CAPTURE_TOKEN)",
       "/sjp/captured-stop/20506",
-      "/sjp/captured-stops?stops=20506,20507",
+      "/sjp/captured-stops?stops=20506,20507&includeOfficialGroups=1",
       "/sjp/captured-trip/7120331",
       "/sjp/stop/21911",
       "/sjp/stop/26898",
@@ -3061,8 +3114,11 @@ app.post("/capture/sjp", (req, res) => {
       ok: true,
       kind: "stop",
       stopId: payload.stopId,
+      stopName: String(payload.requestedStop?.Description || "").trim() || null,
+      likelyOfficialGroupV2254: String(payload.stopId || "").length <= 4 || /\b(?:station|stn|busport|bus station|interchange|terminal)\b/i.test(String(payload.requestedStop?.Description || "")),
       count: payload.count,
       liveCount: payload.liveCount,
+      scheduledCount: payload.scheduledCount,
       capturedAt: payload.capturedAt
     });
   }
@@ -3171,10 +3227,14 @@ app.get("/sjp/captured-stops", (req, res) => {
     });
   }
   services.sort((a, b) => sjpServiceSortMsV1(a) - sjpServiceSortMsV1(b));
+  const includeCandidateBoardsV2254 = /^(?:1|true|yes)$/i.test(String(req.query.includeCandidateBoards || req.query.includeOfficialGroups || ""));
+  const candidateBoardsV2254 = includeCandidateBoardsV2254
+    ? capturedSJPCandidateBoardsV2254(stopIds, maxAgeMs)
+    : [];
   res.set("Cache-Control", "no-store");
   return res.status(200).json({
     ok: true,
-    source: "transperth-sjp-mitm-capture-batch-v2253",
+    source: "transperth-sjp-mitm-capture-batch-v2254",
     captureBridgeV2252: true,
     sjpBusBoardV2253: true,
     requestedStopIds: stopIds,
@@ -3188,6 +3248,9 @@ app.get("/sjp/captured-stops", (req, res) => {
     oldestCaptureAgeMs,
     components,
     services,
+    candidateOfficialBoardsV2254: candidateBoardsV2254,
+    candidateOfficialBoardCountV2254: candidateBoardsV2254.length,
+    candidateOfficialGroupBoardCountV2254: candidateBoardsV2254.filter(board => board?.likelyOfficialGroupV2254 === true).length,
     capturedAt: newestCapturedAtMs > 0 ? new Date(newestCapturedAtMs).toISOString() : null,
     fetchedAt: new Date().toISOString()
   });
