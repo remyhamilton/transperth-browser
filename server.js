@@ -1768,8 +1768,9 @@ app.get("/", (req, res) => {
     stats,
     endpoints: [
       "/health",
-      "/sjp/stop/11620",
-      "/sjp/group?stops=12195,12196,12197,12198,12199,12200",
+      "/sjp/stop/21911",
+      "/sjp/stop/26898",
+      "/sjp/group?stops=21911,26898",
       "/live-stop/26768?limit=5",
       "/live-stops?stops=27172,27180,27184&perStop=10&completeOnly=1",
       "/live-stop-components-multiplex?stops=27431,27432,27433,27434,27435,27437,27438,27439,27440,27441,27442&perStop=30&liveOnly=0&allowPageFallback=0",
