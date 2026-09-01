@@ -13,7 +13,7 @@ services:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
       - key: BROWSER_POOL_SIZE
-        value: "4"
+        value: "2"
       - key: NAVIGATION_TIMEOUT_MS
         value: "12000"
       - key: ROW_WAIT_TIMEOUT_MS
@@ -27,9 +27,9 @@ services:
       - key: QUEUE_TIMEOUT_MS
         value: "7000"
       - key: FRESH_CACHE_MS
-        value: "10000"
+        value: "120000"
       - key: STALE_CACHE_MS
-        value: "60000"
+        value: "900000"
       - key: MAX_CACHE_ENTRIES
         value: "160"
       - key: BATCH_MAX_STOPS
@@ -37,15 +37,15 @@ services:
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
-        value: "60"
+        value: "3"
       - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
         value: "2600"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
-        value: "1"
+        value: "0"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS
-        value: "60"
+        value: "250"
       - key: ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY
-        value: "6"
+        value: "1"
       - key: ATOMIC_COMPONENT_PARSE_CHUNK
         value: "60"
       - key: ATOMIC_COMPONENT_MAX_HTML_BYTES
@@ -59,7 +59,7 @@ services:
       - key: ATOMIC_FOREGROUND_PAGE_FALLBACK_V35
         value: "0"
       - key: BATCH_FRESH_CACHE_MS
-        value: "15000"
+        value: "120000"
       - key: BATCH_STALE_CACHE_MS
         value: "900000"
       - key: BATCH_CACHE_MAX_ENTRIES
@@ -67,13 +67,17 @@ services:
       - key: BATCH_KEEP_WARM_MS
         value: "300000"
       - key: BATCH_REFRESH_INTERVAL_MS
-        value: "45000"
+        value: "120000"
       - key: BATCH_REFRESH_LEAD_MS
-        value: "15000"
+        value: "20000"
       - key: BATCH_REFRESH_MAX_PER_TICK
-        value: "2"
+        value: "1"
+      - key: BATCH_BACKGROUND_REFRESH_ENABLED
+        value: "0"
+      - key: PREWARM_KNOWN_GROUPS
+        value: "0"
       - key: PAGE_MAX_USES
-        value: "80"
+        value: "60"
       - key: MEMORY_CHECK_INTERVAL_MS
         value: "60000"
       - key: HEAP_SOFT_LIMIT_MB
