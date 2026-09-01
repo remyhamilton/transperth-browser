@@ -1,3 +1,4 @@
+// v2253 SJP capture batch-read endpoint for single/group Hubway bus boards.
 "use strict";
 
 // Keep the Playwright browser inside the deployed project rather than Render's
@@ -1944,7 +1945,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.7-sjp-capture-v2252",
+    service: "transperth-browser-v3.8-sjp-board-v2253",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1963,6 +1964,7 @@ app.get("/", (req, res) => {
       "/health",
       "POST /capture/sjp (SJP_CAPTURE_TOKEN)",
       "/sjp/captured-stop/20506",
+      "/sjp/captured-stops?stops=20506,20507",
       "/sjp/captured-trip/7120331",
       "/sjp/stop/21911",
       "/sjp/stop/26898",
@@ -3109,6 +3111,86 @@ app.get("/sjp/captured-stop/:stopId", (req, res) => {
     });
   }
   return res.status(200).json(payload);
+});
+
+app.get("/sjp/captured-stops", (req, res) => {
+  stats.requests += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  const stopIds = Array.from(new Set(
+    String(req.query.stops || req.query.stopIds || req.query.stop || "")
+      .split(/[\s,;|]+/)
+      .map(value => value.trim())
+      .filter(value => /^\d{1,8}$/.test(value))
+  )).slice(0, 96);
+  if (!stopIds.length) {
+    return res.status(400).json({ ok: false, error: "Provide stops=20506,20507" });
+  }
+  const maxAgeMs = positiveInt(
+    req.query.maxAgeMs,
+    SJP_CAPTURE_TTL_MS_V2252,
+    1000,
+    SJP_CAPTURE_TTL_MS_V2252
+  );
+  const components = [];
+  const hitStopIds = [];
+  const missingStopIds = [];
+  const services = [];
+  let newestCapturedAtMs = 0;
+  let oldestCaptureAgeMs = null;
+  for (const stopId of stopIds) {
+    const payload = capturedSJPStopV2252(stopId, maxAgeMs);
+    if (!payload) {
+      missingStopIds.push(stopId);
+      continue;
+    }
+    hitStopIds.push(stopId);
+    const componentServices = (Array.isArray(payload.services) ? payload.services : []).map(service => ({
+      ...service,
+      stopId: String(service?.stopId || stopId),
+      groupedComponentStopId: stopId,
+      source: String(service?.source || "transperth-sjp-stop-v1"),
+      provider: "realtime.transperth.info",
+      origin: "transperth-sjp-captured-stop-v2253"
+    }));
+    services.push(...componentServices);
+    const capturedAtMs = Number(payload.capturedAtMs || Date.parse(payload.capturedAt || "") || 0);
+    if (capturedAtMs > newestCapturedAtMs) newestCapturedAtMs = capturedAtMs;
+    const ageMs = Number(payload.captureAgeMs || 0);
+    if (Number.isFinite(ageMs)) {
+      oldestCaptureAgeMs = oldestCaptureAgeMs == null ? ageMs : Math.max(oldestCaptureAgeMs, ageMs);
+    }
+    components.push({
+      stopId,
+      stopName: String(payload.requestedStop?.Description || payload.stopName || `Stop ${stopId}`),
+      count: componentServices.length,
+      liveCount: componentServices.filter(service => service.live === true).length,
+      scheduledCount: componentServices.filter(service => service.live !== true).length,
+      captureAgeMs: ageMs,
+      capturedAt: payload.capturedAt || null,
+      authoritativeEmpty: componentServices.length === 0
+    });
+  }
+  services.sort((a, b) => sjpServiceSortMsV1(a) - sjpServiceSortMsV1(b));
+  res.set("Cache-Control", "no-store");
+  return res.status(200).json({
+    ok: true,
+    source: "transperth-sjp-mitm-capture-batch-v2253",
+    captureBridgeV2252: true,
+    sjpBusBoardV2253: true,
+    requestedStopIds: stopIds,
+    hitStopIds,
+    missingStopIds,
+    allCaptured: missingStopIds.length === 0,
+    componentCount: components.length,
+    count: services.length,
+    liveCount: services.filter(service => service.live === true).length,
+    scheduledCount: services.filter(service => service.live !== true).length,
+    oldestCaptureAgeMs,
+    components,
+    services,
+    capturedAt: newestCapturedAtMs > 0 ? new Date(newestCapturedAtMs).toISOString() : null,
+    fetchedAt: new Date().toISOString()
+  });
 });
 
 app.get("/sjp/captured-trip/:tripId", (req, res) => {
