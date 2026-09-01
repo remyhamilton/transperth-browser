@@ -25,16 +25,16 @@ const LIVE_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.LIVE_ROW_WAIT_TIMEOUT_M
 const LIVE_SETTLE_MS = positiveInt(process.env.LIVE_SETTLE_MS, 80, 0, 500);
 const BLOCK_STYLESHEETS = String(process.env.BLOCK_STYLESHEETS || "1") !== "0";
 const QUEUE_TIMEOUT_MS = positiveInt(process.env.QUEUE_TIMEOUT_MS, 7000, 500, 20000);
-const FRESH_CACHE_MS = positiveInt(process.env.FRESH_CACHE_MS, 8000, 0, 60000);
-const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 45000, 0, 300000);
+const FRESH_CACHE_MS = positiveInt(process.env.FRESH_CACHE_MS, 120000, 0, 300000);
+const STALE_CACHE_MS = positiveInt(process.env.STALE_CACHE_MS, 900000, 0, 3600000);
 const MAX_CACHE_ENTRIES = positiveInt(process.env.MAX_CACHE_ENTRIES, 250, 10, 2000);
 const BATCH_MAX_STOPS = positiveInt(process.env.BATCH_MAX_STOPS, 60, 2, 120);
 const BATCH_ROW_WAIT_TIMEOUT_MS = positiveInt(process.env.BATCH_ROW_WAIT_TIMEOUT_MS, 900, 250, 4000);
-const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 60, 2, 120);
+const ATOMIC_COMPONENT_HTTP_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_CONCURRENCY, 3, 1, 12);
 const ATOMIC_COMPONENT_HTTP_TIMEOUT_MS = positiveInt(process.env.ATOMIC_COMPONENT_HTTP_TIMEOUT_MS, 6000, 1000, 12000);
-const ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 1, 0, 2);
+const ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS, 0, 0, 2);
 const ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS = positiveInt(process.env.ATOMIC_COMPONENT_DIRECT_RETRY_DELAY_MS, 60, 0, 1000);
-const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 6, 1, 8);
+const ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY = positiveInt(process.env.ATOMIC_COMPONENT_PAGE_FALLBACK_CONCURRENCY, 1, 1, 4);
 const ATOMIC_COMPONENT_PARSE_CHUNK = positiveInt(process.env.ATOMIC_COMPONENT_PARSE_CHUNK, 60, 2, 120);
 const ATOMIC_COMPONENT_MAX_HTML_BYTES = positiveInt(process.env.ATOMIC_COMPONENT_MAX_HTML_BYTES, 1500000, 100000, 4000000);
 const ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35 = positiveInt(process.env.ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35, 4200, 1200, 8000);
@@ -43,19 +43,23 @@ const ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 = String(process.env.ATOMIC_ACCEPT_VERIFI
 const ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 = String(process.env.ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 || "0") === "1";
 const ATOMIC_NATIVE_AGENT_V35 = new https.Agent({
   keepAlive: true,
-  maxSockets: 80,
-  maxFreeSockets: 24,
+  // v3.6 pressure governor: never fan a large interchange out as dozens of
+  // simultaneous origin connections. This cap is process-wide for native MOBI.
+  maxSockets: 3,
+  maxFreeSockets: 3,
   scheduling: "lifo",
   timeout: 10000
-});
-const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 30000, 1000, 120000);
+ });
+const BATCH_BACKGROUND_REFRESH_ENABLED = String(process.env.BATCH_BACKGROUND_REFRESH_ENABLED || "0") === "1";
+const PREWARM_KNOWN_GROUPS = String(process.env.PREWARM_KNOWN_GROUPS || "0") === "1";
+const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 120000, 1000, 300000);
 const BATCH_STALE_CACHE_MS = positiveInt(process.env.BATCH_STALE_CACHE_MS, 1800000, 5000, 3600000);
 const BATCH_CACHE_MAX_ENTRIES = positiveInt(process.env.BATCH_CACHE_MAX_ENTRIES, 80, 4, 250);
 const BATCH_KEEP_WARM_MS = positiveInt(process.env.BATCH_KEEP_WARM_MS, 300000, 60000, 3600000);
-const BATCH_REFRESH_INTERVAL_MS = positiveInt(process.env.BATCH_REFRESH_INTERVAL_MS, 45000, 10000, 300000);
+const BATCH_REFRESH_INTERVAL_MS = positiveInt(process.env.BATCH_REFRESH_INTERVAL_MS, 120000, 10000, 600000);
 const BATCH_REFRESH_LEAD_MS = positiveInt(process.env.BATCH_REFRESH_LEAD_MS, 15000, 1000, 120000);
-const BATCH_REFRESH_MAX_PER_TICK = positiveInt(process.env.BATCH_REFRESH_MAX_PER_TICK, 2, 1, 12);
-const PAGE_MAX_USES = positiveInt(process.env.PAGE_MAX_USES, 80, 10, 500);
+const BATCH_REFRESH_MAX_PER_TICK = positiveInt(process.env.BATCH_REFRESH_MAX_PER_TICK, 1, 1, 4);
+const PAGE_MAX_USES = positiveInt(process.env.PAGE_MAX_USES, 60, 10, 500);
 const MEMORY_CHECK_INTERVAL_MS = positiveInt(process.env.MEMORY_CHECK_INTERVAL_MS, 60000, 15000, 300000);
 const HEAP_SOFT_LIMIT_MB = positiveInt(process.env.HEAP_SOFT_LIMIT_MB, 650, 128, 4096);
 const SERVICE_WARM_RECENT_MAX_ENTRIES = positiveInt(process.env.SERVICE_WARM_RECENT_MAX_ENTRIES, 256, 16, 2000);
@@ -1544,7 +1548,7 @@ app.get("/health", async (req, res) => {
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "–", mdash: "—", hellip: "…"
+    ndash: "â€“", mdash: "â€”", hellip: "â€¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -1813,7 +1817,10 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
         "Cache-Control": "no-cache, no-store",
         "Pragma": "no-cache",
         "Connection": "keep-alive",
-        "User-Agent": "Hubway-Render/3.5-All-ID-Native-Multiplex"
+        "Accept-Language": "en-AU,en;q=0.9",
+        // Keep one stable, ordinary browser-compatible request profile. Do not
+        // rotate identities or headers to evade origin controls.
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
       }
     }, response => {
       const status = Number(response.statusCode || 0);
@@ -1851,9 +1858,10 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
 async function fetchStopHTMLNativeV35(stopId) {
   stats.atomicNativeHTTPFetchesV35 += 1;
   const startedAt = Date.now();
-  const requestURL = new URL(stopUrl(stopId));
-  requestURL.searchParams.set("_hubwayNative", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  const response = await nativeHTTPSGetV35(requestURL.toString(), ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35);
+  // v3.6: use the canonical stop URL. The old per-request _hubwayNative cache
+  // buster made every fetch unique at the origin and defeated any harmless
+  // upstream caching/coalescing.
+  const response = await nativeHTTPSGetV35(stopUrl(stopId), ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35);
   if (response.ok) stats.atomicNativeHTTPSuccessesV35 += 1;
   else stats.atomicNativeHTTPErrorsV35 += 1;
   return { stopId: String(stopId), ...response, ms: Date.now() - startedAt, transportV35: "native-https" };
@@ -1867,10 +1875,10 @@ async function fetchStopHTMLDirectV32(stopId) {
   await ensureBrowser();
   stats.atomicComponentHTTPFetchesV32 += 1;
   const startedAt = Date.now();
-  const requestURL = new URL(stopUrl(stopId));
-  requestURL.searchParams.set("_hubwayAtomic", String(Date.now()));
+  // v3.6: keep the BrowserContext request on the same canonical URL as a real
+  // navigation instead of appending an automation-specific cache buster.
   try {
-    const response = await context.request.get(requestURL.toString(), {
+    const response = await context.request.get(stopUrl(stopId), {
       timeout: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35,
       failOnStatusCode: false,
       headers: {
@@ -2621,16 +2629,24 @@ process.on("uncaughtException", error => {
 app.listen(PORT, async () => {
   try {
     await ensureBrowser();
-    console.log(`Transperth browser v3.4 listening on port ${PORT}; pool=${POOL_SIZE}`);
+    console.log(`Transperth browser v3.6 pressure-governor listening on port ${PORT}; pool=${POOL_SIZE}; mobiConcurrency=${ATOMIC_COMPONENT_HTTP_CONCURRENCY}`);
     console.log(`Playwright Chromium: ${chromium.executablePath()}`);
-    void prewarmKnownGroupedStops().then(() => {
-      console.log("Known grouped-stop caches prewarmed.");
-    });
+    if (PREWARM_KNOWN_GROUPS) {
+      void prewarmKnownGroupedStops().then(() => {
+        console.log("Known grouped-stop caches prewarmed.");
+      });
+    } else {
+      console.log("v3.6 pressure governor: startup grouped prewarm disabled.");
+    }
 
-    const groupedRefreshTimer = setInterval(() => {
-      void refreshRecentlyRequestedGroupedStops();
-    }, BATCH_REFRESH_INTERVAL_MS);
-    groupedRefreshTimer.unref?.();
+    if (BATCH_BACKGROUND_REFRESH_ENABLED) {
+      const groupedRefreshTimer = setInterval(() => {
+        void refreshRecentlyRequestedGroupedStops();
+      }, BATCH_REFRESH_INTERVAL_MS);
+      groupedRefreshTimer.unref?.();
+    } else {
+      console.log("v3.6 pressure governor: Render-side grouped background refresh disabled; caller/cron owns cadence.");
+    }
 
     const memoryTimer = setInterval(() => {
       monitorMemory();
