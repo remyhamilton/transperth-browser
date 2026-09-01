@@ -71,6 +71,19 @@ const SERVICE_WARM_RECENT_MS = positiveInt(process.env.SERVICE_WARM_RECENT_MS, 4
 const SERVICE_WARM_FAILED_RECENT_MS = positiveInt(process.env.SERVICE_WARM_FAILED_RECENT_MS, 2000, 500, 10000);
 const SERVICE_WARM_QUEUE_MAX = positiveInt(process.env.SERVICE_WARM_QUEUE_MAX, 80, 8, 300);
 
+// Transperth SJP JSON test lane. Keep the upstream authorization material in
+// Render environment variables; never commit it to this file. The captured
+// PhoneApp Authorization value may be short-lived, so this lane intentionally
+// fails closed when it is not configured.
+const SJP_BASE_URL = String(process.env.SJP_BASE_URL || "https://realtime.transperth.info").trim().replace(/\/$/, "");
+const SJP_AUTHORIZATION = String(process.env.SJP_AUTHORIZATION || "").trim();
+const SJP_AV = String(process.env.SJP_AV || "2.12.3").trim();
+const SJP_RV = String(process.env.SJP_RV || "Pi2123.1x").trim();
+const SJP_USER_AGENT = String(process.env.SJP_USER_AGENT || "Transperth/132426 CFNetwork/3860.700.1 Darwin/25.6.0").trim();
+const SJP_TIMEOUT_MS = positiveInt(process.env.SJP_TIMEOUT_MS, 4500, 1000, 15000);
+const SJP_GROUP_CONCURRENCY = positiveInt(process.env.SJP_GROUP_CONCURRENCY, 3, 1, 8);
+const SJP_CACHE_MS = positiveInt(process.env.SJP_CACHE_MS, 15000, 0, 120000);
+
 let browser = null;
 let context = null;
 let shuttingDown = false;
@@ -92,6 +105,8 @@ const groupedSnapshotGeneration = new Map();
 const serviceWarmPending = [];
 const serviceWarmInFlight = new Map();
 const serviceWarmRecent = new Map();
+const sjpStopCache = new Map();
+const sjpStopInFlight = new Map();
 const managedPages = new Set();
 const pageUseCount = new WeakMap();
 const replacingPages = new WeakSet();
@@ -156,7 +171,14 @@ const stats = {
   atomicContextRetryFetchesV35: 0,
   atomicFastParserDocumentsV35: 0,
   atomicVerifiedEmptyComponentsV35: 0,
-  atomicPageFallbacksSkippedV35: 0
+  atomicPageFallbacksSkippedV35: 0,
+  sjpStopRequestsV1: 0,
+  sjpGroupRequestsV1: 0,
+  sjpUpstreamRequestsV1: 0,
+  sjpUpstreamSuccessesV1: 0,
+  sjpUpstreamErrorsV1: 0,
+  sjpCacheHitsV1: 0,
+  sjpCoalescedV1: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -449,6 +471,250 @@ function authOk(req) {
   const suppliedBuffer = Buffer.from(supplied);
   return expectedBuffer.length === suppliedBuffer.length &&
     crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function sjpAuthConfiguredV1() {
+  return /^Custom\s+/i.test(SJP_AUTHORIZATION);
+}
+
+function perthMinuteStampV1(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Australia/Perth",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const value = type => parts.find(part => part.type === type)?.value || "";
+  return `${value("year")}-${value("month")}-${value("day")}T${value("hour")}:${value("minute")}`;
+}
+
+function validSJPRequestTimeV1(value) {
+  const clean = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(clean) ? clean : null;
+}
+
+function parseSJPPositionV1(value) {
+  const clean = String(value || "").trim();
+  if (!clean) return { latitude: null, longitude: null };
+  const pieces = clean.split(/[\s,]+/).map(Number).filter(Number.isFinite);
+  if (pieces.length < 2) return { latitude: null, longitude: null };
+  const [latitude, longitude] = pieces;
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    return { latitude: null, longitude: null };
+  }
+  return { latitude, longitude };
+}
+
+function sjpClockTextV1(value) {
+  const clean = String(value || "").trim();
+  if (!clean) return null;
+  const iso = clean.match(/T(\d{2}:\d{2})(?::(\d{2}))?/);
+  if (iso) return iso[2] ? `${iso[1]}:${iso[2]}` : iso[1];
+  const duration = clean.match(/(?:^|\.)(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (duration) return duration[3]
+    ? `${duration[1]}:${duration[2]}:${duration[3]}`
+    : `${duration[1]}:${duration[2]}`;
+  return clean;
+}
+
+function sjpServiceSortMsV1(service) {
+  const candidates = [service?.scheduledDepartureISO, service?.scheduledArrivalISO];
+  for (const candidate of candidates) {
+    const ms = Date.parse(String(candidate || ""));
+    if (Number.isFinite(ms)) return ms;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeSJPTripV1(trip, requestedStopId) {
+  const summary = trip?.Summary || {};
+  const summaryRealtime = summary?.RealTimeInfo || null;
+  const stopRealtime = trip?.RealTimeInfo || null;
+  const position = parseSJPPositionV1(summaryRealtime?.CurrentPosition);
+  const tripId = String(summary?.TripSourceId || summary?.TripUid || "")
+    .replace(/^PerthRestricted:/i, "")
+    .trim() || null;
+  const tripUid = String(summary?.TripUid || (tripId ? `PerthRestricted:${tripId}` : "")).trim() || null;
+  const fleetNumber = String(summaryRealtime?.FleetNumber || "").trim() || null;
+  const vehicleId = String(summaryRealtime?.VehicleId || "").trim() || null;
+  const scheduledDepartureISO = String(trip?.DepartTime || "").trim() || null;
+  const scheduledArrivalISO = String(trip?.ArriveTime || "").trim() || null;
+  const estimatedDepartureRaw = String(stopRealtime?.EstimatedDepartureTime || "").trim() || null;
+  const estimatedArrivalRaw = String(stopRealtime?.EstimatedArrivalTime || "").trim() || null;
+  const actualDepartureRaw = String(stopRealtime?.ActualDepartureTime || "").trim() || null;
+  const actualArrivalRaw = String(stopRealtime?.ActualArrivalTime || "").trim() || null;
+  const hasLiveVehicle = Boolean(summaryRealtime && (fleetNumber || vehicleId || position.latitude != null));
+  const hasRealtimeStop = Boolean(stopRealtime && Number(stopRealtime?.RealTimeTripStatus || 0) > 0);
+  const live = hasLiveVehicle || hasRealtimeStop;
+  const estimatedDepartureTime = sjpClockTextV1(estimatedDepartureRaw);
+  const estimatedArrivalTime = sjpClockTextV1(estimatedArrivalRaw);
+  const actualDepartureTime = sjpClockTextV1(actualDepartureRaw);
+  const actualArrivalTime = sjpClockTextV1(actualArrivalRaw);
+  const scheduledTime = sjpClockTextV1(scheduledDepartureISO || scheduledArrivalISO);
+  const liveTime = actualDepartureTime || estimatedDepartureTime || actualArrivalTime || estimatedArrivalTime || null;
+
+  return {
+    route: String(summary?.RouteCode || summary?.RouteName || "").trim() || null,
+    routeName: String(summary?.RouteName || "").trim() || null,
+    destination: String(summary?.Headsign || trip?.Destination?.Name || "").trim() || null,
+    headsign: String(summary?.Headsign || "").trim() || null,
+    mode: String(summary?.Mode || "").trim() || null,
+    tripId,
+    tripUid,
+    routeUid: String(summary?.RouteUid || "").trim() || null,
+    routeSourceId: String(summary?.RouteSourceId || "").trim() || null,
+    tripStartTime: String(summary?.TripStartTime || "").trim() || null,
+    direction: String(summary?.Direction || "").trim() || null,
+    stopId: String(requestedStopId || "").trim() || null,
+    sequenceNumber: String(trip?.SequenceNumber || "").trim() || null,
+    scheduledArrivalISO,
+    scheduledDepartureISO,
+    scheduledTime,
+    estimatedArrivalTime,
+    estimatedDepartureTime,
+    actualArrivalTime,
+    actualDepartureTime,
+    liveTime,
+    time: liveTime || scheduledTime,
+    statusText: live ? "Live" : "Scheduled",
+    status: live ? "Live" : "Scheduled",
+    live,
+    scheduled: !live,
+    realTimeTripStatus: Number.isFinite(Number(stopRealtime?.RealTimeTripStatus))
+      ? Number(stopRealtime.RealTimeTripStatus)
+      : null,
+    fleetNumber,
+    fleet: fleetNumber,
+    vehicleId,
+    latitude: position.latitude,
+    longitude: position.longitude,
+    heading: Number.isFinite(Number(summaryRealtime?.CurrentBearing))
+      ? Number(summaryRealtime.CurrentBearing)
+      : null,
+    liveUpdatedAt: String(summaryRealtime?.LastUpdated || "").trim() || null,
+    originStopId: String(trip?.Origin?.Code || "").trim() || null,
+    originName: String(trip?.Origin?.Name || "").trim() || null,
+    destinationStopId: String(trip?.Destination?.Code || "").trim() || null,
+    destinationName: String(trip?.Destination?.Name || "").trim() || null,
+    provider: "realtime.transperth.info",
+    source: "transperth-sjp-stop-v1"
+  };
+}
+
+function pruneSJPStopCacheV1(now = Date.now()) {
+  for (const [key, entry] of sjpStopCache.entries()) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) sjpStopCache.delete(key);
+  }
+  while (sjpStopCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = sjpStopCache.keys().next().value;
+    if (oldest == null) break;
+    sjpStopCache.delete(oldest);
+  }
+}
+
+async function fetchSJPStopV1(stopId, options = {}) {
+  const cleanStopId = String(stopId || "").trim();
+  if (!/^\d{1,8}$/.test(cleanStopId)) throw new Error("Invalid stop number");
+  if (!sjpAuthConfiguredV1()) {
+    const error = new Error("SJP_AUTHORIZATION is not configured on Render");
+    error.code = "SJP_AUTH_NOT_CONFIGURED";
+    throw error;
+  }
+  const requestTime = validSJPRequestTimeV1(options.time) || perthMinuteStampV1();
+  const key = `${cleanStopId}|${requestTime}`;
+  const now = Date.now();
+  pruneSJPStopCacheV1(now);
+  if (options.fresh !== true) {
+    const cached = sjpStopCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      stats.sjpCacheHitsV1 += 1;
+      return { ...structuredCloneSafe(cached.payload), cache: { hit: true, ageMs: now - cached.createdAt } };
+    }
+  }
+  if (sjpStopInFlight.has(key)) {
+    stats.sjpCoalescedV1 += 1;
+    return sjpStopInFlight.get(key);
+  }
+
+  const promise = (async () => {
+    const startedAt = Date.now();
+    stats.sjpUpstreamRequestsV1 += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("sjp-stop-timeout")), SJP_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${SJP_BASE_URL}/SJP/Stop`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Accept": "*/*",
+          "Authorization": SJP_AUTHORIZATION,
+          "Accept-Language": "en-AU,en;q=0.9",
+          "Content-Type": "application/json",
+          "User-Agent": SJP_USER_AGENT,
+          "av": SJP_AV,
+          "rv": SJP_RV
+        },
+        body: JSON.stringify({
+          StopUid: `PerthRestricted:${cleanStopId}`,
+          Time: requestTime,
+          TransportModes: "Bus;School Bus;Rail;Ferry",
+          ReturnNotes: true,
+          IsRealTimeChecked: true
+        })
+      });
+      const text = await response.text();
+      let upstream = null;
+      try { upstream = JSON.parse(text); } catch {}
+      if (!response.ok || !upstream || Number(upstream?.Status?.Severity || 0) > 1) {
+        stats.sjpUpstreamErrorsV1 += 1;
+        const message = upstream?.Status?.Message || upstream?.Status?.Description || text.slice(0, 240) || `HTTP ${response.status}`;
+        const error = new Error(`SJP /Stop failed: ${message}`);
+        error.status = response.status;
+        throw error;
+      }
+      stats.sjpUpstreamSuccessesV1 += 1;
+      const services = (Array.isArray(upstream?.Trips) ? upstream.Trips : [])
+        .map(trip => normalizeSJPTripV1(trip, cleanStopId))
+        .filter(service => service.route && service.destination && service.tripId)
+        .sort((a, b) => sjpServiceSortMsV1(a) - sjpServiceSortMsV1(b));
+      const liveCount = services.filter(service => service.live === true).length;
+      const payload = {
+        ok: true,
+        source: "transperth-sjp-stop-v1",
+        stopId: cleanStopId,
+        stopUid: `PerthRestricted:${cleanStopId}`,
+        requestedTime: requestTime,
+        upstreamTimeBandMinutes: Number(upstream?.Request?.TimeBand || 0) || null,
+        requestedStop: upstream?.RequestedStop || null,
+        count: services.length,
+        liveCount,
+        scheduledCount: Math.max(0, services.length - liveCount),
+        services,
+        notes: Array.isArray(upstream?.Notes) ? upstream.Notes : [],
+        fetchedAt: new Date().toISOString(),
+        timings: { upstreamMs: Date.now() - startedAt },
+        ...(options.raw === true ? { raw: upstream } : {})
+      };
+      if (SJP_CACHE_MS > 0 && options.raw !== true) {
+        sjpStopCache.set(key, {
+          payload: structuredCloneSafe(payload),
+          createdAt: Date.now(),
+          expiresAt: Date.now() + SJP_CACHE_MS
+        });
+        pruneSJPStopCacheV1();
+      }
+      return payload;
+    } finally {
+      clearTimeout(timer);
+    }
+  })().finally(() => {
+    if (sjpStopInFlight.get(key) === promise) sjpStopInFlight.delete(key);
+  });
+  sjpStopInFlight.set(key, promise);
+  return promise;
 }
 
 function browserOptions() {
@@ -1502,6 +1768,8 @@ app.get("/", (req, res) => {
     stats,
     endpoints: [
       "/health",
+      "/sjp/stop/11620",
+      "/sjp/group?stops=12195,12196,12197,12198,12199,12200",
       "/live-stop/26768?limit=5",
       "/live-stops?stops=27172,27180,27184&perStop=10&completeOnly=1",
       "/live-stop-components-multiplex?stops=27431,27432,27433,27434,27435,27437,27438,27439,27440,27441,27442&perStop=30&liveOnly=0&allowPageFallback=0",
@@ -1534,7 +1802,7 @@ app.get("/health", async (req, res) => {
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "Ã¢â‚¬â€œ", mdash: "Ã¢â‚¬â€", hellip: "Ã¢â‚¬Â¦"
+    ndash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“", mdash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â", hellip: "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -2525,6 +2793,139 @@ app.get("/live-stops", async (req, res) => {
       source: "136213-browser-v3.3-batched-stops",
       stopIds,
       error: String(error.message || error),
+      fetchedAt: new Date().toISOString(),
+      timings: { requestTotalMs: Date.now() - startedAt }
+    });
+  }
+});
+
+app.get("/sjp/stop/:stopId", async (req, res) => {
+  stats.requests += 1;
+  stats.sjpStopRequestsV1 += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  const stopId = String(req.params.stopId || "").trim();
+  if (!/^\d{1,8}$/.test(stopId)) {
+    return res.status(400).json({ ok: false, error: "Invalid stop number" });
+  }
+  const requestedTime = validSJPRequestTimeV1(req.query.time) || perthMinuteStampV1();
+  const raw = String(req.query.raw || "0") === "1";
+  const fresh = String(req.query.fresh || req.query.refresh || "0") === "1";
+  const startedAt = Date.now();
+  try {
+    const payload = await fetchSJPStopV1(stopId, { time: requestedTime, raw, fresh });
+    res.set("Cache-Control", "no-store");
+    return res.status(200).json({
+      ...payload,
+      windowMinutesRequested: 120,
+      timings: { ...(payload.timings || {}), totalMs: Date.now() - startedAt }
+    });
+  } catch (error) {
+    const authMissing = error?.code === "SJP_AUTH_NOT_CONFIGURED";
+    return res.status(authMissing ? 503 : (Number(error?.status) || 502)).json({
+      ok: false,
+      source: "transperth-sjp-stop-v1-error",
+      stopId,
+      requestedTime,
+      error: String(error?.message || error),
+      authConfigured: sjpAuthConfiguredV1(),
+      fetchedAt: new Date().toISOString(),
+      timings: { totalMs: Date.now() - startedAt }
+    });
+  }
+});
+
+app.get("/sjp/group", async (req, res) => {
+  stats.requests += 1;
+  stats.sjpGroupRequestsV1 += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  const stopIds = uniqueStopIds(req.query.stops || req.query.stopIds || req.query.ids);
+  if (stopIds.length < 2) {
+    return res.status(400).json({ ok: false, error: "Provide at least two stop IDs with stops=123,456" });
+  }
+  const requestedTime = validSJPRequestTimeV1(req.query.time) || perthMinuteStampV1();
+  const fresh = String(req.query.fresh || req.query.refresh || "0") === "1";
+  const includeRaw = String(req.query.raw || "0") === "1";
+  const visibleLimit = positiveInt(req.query.visibleLimit, stopIds.length >= 6 ? 10 : 200, 1, 500);
+  const startedAt = Date.now();
+
+  try {
+    const rowsByStop = await mapLimit(
+      stopIds,
+      Math.min(SJP_GROUP_CONCURRENCY, stopIds.length),
+      async stopId => {
+        try {
+          const payload = await fetchSJPStopV1(stopId, {
+            time: requestedTime,
+            fresh,
+            raw: includeRaw
+          });
+          return {
+            stopId,
+            ok: true,
+            count: payload.count,
+            liveCount: payload.liveCount,
+            scheduledCount: payload.scheduledCount,
+            upstreamTimeBandMinutes: payload.upstreamTimeBandMinutes,
+            services: payload.services,
+            ...(includeRaw ? { raw: payload.raw } : {})
+          };
+        } catch (error) {
+          return {
+            stopId,
+            ok: false,
+            count: 0,
+            services: [],
+            error: String(error?.message || error)
+          };
+        }
+      }
+    );
+
+    const failedStopIds = rowsByStop.filter(row => row.ok !== true).map(row => row.stopId);
+    const services = rowsByStop
+      .flatMap(row => (row.services || []).map(service => ({
+        ...service,
+        groupedComponentStopId: row.stopId
+      })))
+      .sort((a, b) => sjpServiceSortMsV1(a) - sjpServiceSortMsV1(b));
+    const liveCount = services.filter(service => service.live === true).length;
+    const largeGroup = stopIds.length >= 6;
+    const visibleServices = largeGroup ? services.slice(0, visibleLimit) : services;
+    const complete = failedStopIds.length === 0;
+
+    res.set("Cache-Control", "no-store");
+    return res.status(complete ? 200 : 207).json({
+      ok: complete || services.length > 0,
+      source: complete ? "transperth-sjp-group-v1-complete" : "transperth-sjp-group-v1-partial",
+      grouped: true,
+      stopIds,
+      requestedTime,
+      windowMinutesRequested: 120,
+      componentCount: stopIds.length,
+      completedComponentCount: stopIds.length - failedStopIds.length,
+      failedComponentCount: failedStopIds.length,
+      failedStopIds,
+      largeGroup,
+      visibleLimit: largeGroup ? visibleLimit : null,
+      count: services.length,
+      liveCount,
+      scheduledCount: Math.max(0, services.length - liveCount),
+      services,
+      visibleServices,
+      rowsByStop,
+      fetchedAt: new Date().toISOString(),
+      timings: { requestTotalMs: Date.now() - startedAt, concurrency: SJP_GROUP_CONCURRENCY }
+    });
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      source: "transperth-sjp-group-v1-error",
+      stopIds,
+      requestedTime,
+      error: String(error?.message || error),
+      authConfigured: sjpAuthConfiguredV1(),
       fetchedAt: new Date().toISOString(),
       timings: { requestTotalMs: Date.now() - startedAt }
     });
