@@ -84,6 +84,22 @@ services:
         value: "650"
       - key: SERVICE_WARM_RECENT_MAX_ENTRIES
         value: "256"
+      - key: SJP_BASE_URL
+        value: "https://realtime.transperth.info"
+      - key: SJP_AUTHORIZATION
+        sync: false
+      - key: SJP_AV
+        value: "2.12.3"
+      - key: SJP_RV
+        value: "Pi2123.1x"
+      - key: SJP_USER_AGENT
+        value: "Transperth/132426 CFNetwork/3860.700.1 Darwin/25.6.0"
+      - key: SJP_TIMEOUT_MS
+        value: "4500"
+      - key: SJP_GROUP_CONCURRENCY
+        value: "3"
+      - key: SJP_CACHE_MS
+        value: "15000"
       - key: WORKER_BASE_URL
         value: "https://twilight-wildflower-4e89.remy-hamilton.workers.dev"
       - key: SERVICE_WARM_MAX_FLEETS
