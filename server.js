@@ -14,7 +14,7 @@ const { chromium } = require("playwright");
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "64kb" }));
+app.use(express.json({ limit: "512kb" })); // v2252: SJP capture responses can exceed 64 KB
 
 const PORT = positiveInt(process.env.PORT, 3000, 1, 65535);
 const BROWSER_TOKEN = String(process.env.BROWSER_TOKEN || "").trim();
@@ -83,6 +83,12 @@ const SJP_USER_AGENT = String(process.env.SJP_USER_AGENT || "Transperth/132426 C
 const SJP_TIMEOUT_MS = positiveInt(process.env.SJP_TIMEOUT_MS, 4500, 1000, 15000);
 const SJP_GROUP_CONCURRENCY = positiveInt(process.env.SJP_GROUP_CONCURRENCY, 3, 1, 8);
 const SJP_CACHE_MS = positiveInt(process.env.SJP_CACHE_MS, 15000, 0, 120000);
+// v2252 capture bridge: mitmproxy forwards only successful SJP response JSON.
+// It never forwards the PhoneApp Authorization header, nonce, or token.
+const SJP_CAPTURE_TOKEN = String(process.env.SJP_CAPTURE_TOKEN || "").trim();
+const SJP_CAPTURE_TTL_MS_V2252 = positiveInt(process.env.SJP_CAPTURE_TTL_MS, 120000, 15000, 600000);
+const SJP_CAPTURE_MAX_STOPS_V2252 = positiveInt(process.env.SJP_CAPTURE_MAX_STOPS, 160, 8, 1000);
+const SJP_CAPTURE_MAX_TRIPS_V2252 = positiveInt(process.env.SJP_CAPTURE_MAX_TRIPS, 320, 16, 2000);
 
 let browser = null;
 let context = null;
@@ -107,6 +113,8 @@ const serviceWarmInFlight = new Map();
 const serviceWarmRecent = new Map();
 const sjpStopCache = new Map();
 const sjpStopInFlight = new Map();
+const sjpCapturedStopsV2252 = new Map();
+const sjpCapturedTripsV2252 = new Map();
 const managedPages = new Set();
 const pageUseCount = new WeakMap();
 const replacingPages = new WeakSet();
@@ -178,7 +186,13 @@ const stats = {
   sjpUpstreamSuccessesV1: 0,
   sjpUpstreamErrorsV1: 0,
   sjpCacheHitsV1: 0,
-  sjpCoalescedV1: 0
+  sjpCoalescedV1: 0,
+  sjpCaptureIngestRequestsV2252: 0,
+  sjpCaptureStopPublishesV2252: 0,
+  sjpCaptureTripPublishesV2252: 0,
+  sjpCaptureReadHitsV2252: 0,
+  sjpCaptureExpiredV2252: 0,
+  sjpCaptureRejectedV2252: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -477,6 +491,44 @@ function sjpAuthConfiguredV1() {
   return /^Custom\s+/i.test(SJP_AUTHORIZATION);
 }
 
+function sjpCaptureAuthOkV2252(req) {
+  if (!SJP_CAPTURE_TOKEN) return false;
+  const supplied = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const expectedBuffer = Buffer.from(SJP_CAPTURE_TOKEN);
+  const suppliedBuffer = Buffer.from(supplied);
+  return expectedBuffer.length === suppliedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function cleanSJPRestrictedIdV2252(value) {
+  return String(value || "").replace(/^PerthRestricted:/i, "").trim();
+}
+
+function pruneSJPCaptureV2252(now = Date.now()) {
+  for (const [key, entry] of sjpCapturedStopsV2252) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) {
+      sjpCapturedStopsV2252.delete(key);
+      stats.sjpCaptureExpiredV2252 += 1;
+    }
+  }
+  for (const [key, entry] of sjpCapturedTripsV2252) {
+    if (!entry || Number(entry.expiresAt || 0) <= now) {
+      sjpCapturedTripsV2252.delete(key);
+      stats.sjpCaptureExpiredV2252 += 1;
+    }
+  }
+  while (sjpCapturedStopsV2252.size > SJP_CAPTURE_MAX_STOPS_V2252) {
+    const key = sjpCapturedStopsV2252.keys().next().value;
+    if (key == null) break;
+    sjpCapturedStopsV2252.delete(key);
+  }
+  while (sjpCapturedTripsV2252.size > SJP_CAPTURE_MAX_TRIPS_V2252) {
+    const key = sjpCapturedTripsV2252.keys().next().value;
+    if (key == null) break;
+    sjpCapturedTripsV2252.delete(key);
+  }
+}
+
 function perthMinuteStampV1(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Australia/Perth",
@@ -604,6 +656,141 @@ function normalizeSJPTripV1(trip, requestedStopId) {
   };
 }
 
+
+function buildSJPCapturedStopPayloadV2252(upstream, receivedAtMs = Date.now()) {
+  if (!upstream || typeof upstream !== "object") return null;
+  const requestedStop = upstream?.RequestedStop || null;
+  const request = upstream?.Request || null;
+  const stopId = cleanSJPRestrictedIdV2252(
+    requestedStop?.Code ||
+    requestedStop?.StopUid ||
+    request?.StopUid
+  );
+  if (!/^\d{1,8}$/.test(stopId)) return null;
+  const trips = Array.isArray(upstream?.Trips) ? upstream.Trips : [];
+  const services = trips
+    .map(trip => normalizeSJPTripV1(trip, stopId))
+    .filter(service => service.route && service.destination && service.tripId)
+    .sort((a, b) => sjpServiceSortMsV1(a) - sjpServiceSortMsV1(b));
+  const liveCount = services.filter(service => service.live === true).length;
+  return {
+    ok: true,
+    source: "transperth-sjp-mitm-capture-v2252",
+    captureBridgeV2252: true,
+    stopId,
+    stopUid: `PerthRestricted:${stopId}`,
+    requestedTime: String(request?.Time || "").trim() || null,
+    upstreamTimeBandMinutes: Number(request?.TimeBand || 0) || 120,
+    requestedStop,
+    count: services.length,
+    liveCount,
+    scheduledCount: Math.max(0, services.length - liveCount),
+    services,
+    notes: Array.isArray(upstream?.Notes) ? upstream.Notes : [],
+    capturedAt: new Date(receivedAtMs).toISOString(),
+    capturedAtMs: receivedAtMs,
+    fetchedAt: new Date(receivedAtMs).toISOString()
+  };
+}
+
+function buildSJPCapturedTripPayloadV2252(upstream, receivedAtMs = Date.now()) {
+  if (!upstream || typeof upstream !== "object") return null;
+  const summary = upstream?.Summary || {};
+  const realtime = summary?.RealTimeInfo || null;
+  const tripId = cleanSJPRestrictedIdV2252(
+    summary?.TripSourceId ||
+    summary?.TripUid ||
+    upstream?.Request?.TripUid
+  );
+  if (!/^\d{1,12}$/.test(tripId)) return null;
+  const fleetNumber = String(
+    realtime?.FleetNumber ||
+    upstream?.Request?.FleetNumber ||
+    ""
+  ).trim() || null;
+  const vehicleId = String(realtime?.VehicleId || "").trim() || null;
+  const position = parseSJPPositionV1(realtime?.CurrentPosition);
+  const tripStops = (Array.isArray(upstream?.TripStops) ? upstream.TripStops : []).map(stop => {
+    const stopRealtime = stop?.RealTimeInfo || null;
+    const stopId = cleanSJPRestrictedIdV2252(stop?.TransitStop?.Code || stop?.TransitStop?.StopUid);
+    const estimatedDepartureTime = sjpClockTextV1(stopRealtime?.EstimatedDepartureTime);
+    const estimatedArrivalTime = sjpClockTextV1(stopRealtime?.EstimatedArrivalTime);
+    const actualDepartureTime = sjpClockTextV1(stopRealtime?.ActualDepartureTime);
+    const actualArrivalTime = sjpClockTextV1(stopRealtime?.ActualArrivalTime);
+    return {
+      stopId: stopId || null,
+      stopUid: String(stop?.TransitStop?.StopUid || "").trim() || null,
+      stopName: String(stop?.TransitStop?.Description || "").trim() || null,
+      sequenceNumber: String(stop?.SequenceNumber || "").trim() || null,
+      scheduledDepartureISO: String(stop?.DepartureTime || "").trim() || null,
+      scheduledArrivalISO: String(stop?.ArrivalTime || "").trim() || null,
+      estimatedDepartureTime,
+      estimatedArrivalTime,
+      actualDepartureTime,
+      actualArrivalTime,
+      liveTime: actualDepartureTime || estimatedDepartureTime || actualArrivalTime || estimatedArrivalTime || null,
+      realTimeTripStatus: Number.isFinite(Number(stopRealtime?.RealTimeTripStatus))
+        ? Number(stopRealtime.RealTimeTripStatus)
+        : null
+    };
+  });
+  return {
+    ok: true,
+    source: "transperth-sjp-mitm-trip-capture-v2252",
+    captureBridgeV2252: true,
+    tripId,
+    tripUid: String(summary?.TripUid || `PerthRestricted:${tripId}`).trim(),
+    route: String(summary?.RouteCode || summary?.RouteName || "").trim() || null,
+    destination: String(summary?.Headsign || "").trim() || null,
+    fleetNumber,
+    fleet: fleetNumber,
+    vehicleId,
+    latitude: position.latitude,
+    longitude: position.longitude,
+    heading: Number.isFinite(Number(realtime?.CurrentBearing)) ? Number(realtime.CurrentBearing) : null,
+    liveUpdatedAt: String(realtime?.LastUpdated || "").trim() || null,
+    live: Boolean(realtime && (fleetNumber || vehicleId || position.latitude != null)),
+    tripStops,
+    capturedAt: new Date(receivedAtMs).toISOString(),
+    capturedAtMs: receivedAtMs,
+    fetchedAt: new Date(receivedAtMs).toISOString()
+  };
+}
+
+function capturedSJPStopV2252(stopId, maxAgeMs = SJP_CAPTURE_TTL_MS_V2252) {
+  pruneSJPCaptureV2252();
+  const key = String(stopId || "").trim();
+  const entry = sjpCapturedStopsV2252.get(key);
+  if (!entry) return null;
+  const ageMs = Math.max(0, Date.now() - Number(entry.createdAt || 0));
+  if (ageMs > Math.min(SJP_CAPTURE_TTL_MS_V2252, Math.max(1000, Number(maxAgeMs) || SJP_CAPTURE_TTL_MS_V2252))) {
+    return null;
+  }
+  stats.sjpCaptureReadHitsV2252 += 1;
+  return {
+    ...structuredCloneSafe(entry.payload),
+    captureAgeMs: ageMs,
+    cache: { hit: true, kind: "mitm-capture-v2252", ageMs }
+  };
+}
+
+function capturedSJPTripV2252(tripId, maxAgeMs = SJP_CAPTURE_TTL_MS_V2252) {
+  pruneSJPCaptureV2252();
+  const key = String(tripId || "").trim();
+  const entry = sjpCapturedTripsV2252.get(key);
+  if (!entry) return null;
+  const ageMs = Math.max(0, Date.now() - Number(entry.createdAt || 0));
+  if (ageMs > Math.min(SJP_CAPTURE_TTL_MS_V2252, Math.max(1000, Number(maxAgeMs) || SJP_CAPTURE_TTL_MS_V2252))) {
+    return null;
+  }
+  stats.sjpCaptureReadHitsV2252 += 1;
+  return {
+    ...structuredCloneSafe(entry.payload),
+    captureAgeMs: ageMs,
+    cache: { hit: true, kind: "mitm-capture-v2252", ageMs }
+  };
+}
+
 function pruneSJPStopCacheV1(now = Date.now()) {
   for (const [key, entry] of sjpStopCache.entries()) {
     if (!entry || Number(entry.expiresAt || 0) <= now) sjpStopCache.delete(key);
@@ -618,6 +805,12 @@ function pruneSJPStopCacheV1(now = Date.now()) {
 async function fetchSJPStopV1(stopId, options = {}) {
   const cleanStopId = String(stopId || "").trim();
   if (!/^\d{1,8}$/.test(cleanStopId)) throw new Error("Invalid stop number");
+  // v2252: prefer a fresh successful response observed from the official app.
+  // This uses response data only and never replays the PhoneApp Authorization.
+  const capturedV2252 = options.freshDirectV1 === true
+    ? null
+    : capturedSJPStopV2252(cleanStopId, options.captureMaxAgeMsV2252);
+  if (capturedV2252) return capturedV2252;
   if (!sjpAuthConfiguredV1()) {
     const error = new Error("SJP_AUTHORIZATION is not configured on Render");
     error.code = "SJP_AUTH_NOT_CONFIGURED";
@@ -1751,7 +1944,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.5",
+    service: "transperth-browser-v3.7-sjp-capture-v2252",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1768,6 +1961,9 @@ app.get("/", (req, res) => {
     stats,
     endpoints: [
       "/health",
+      "POST /capture/sjp (SJP_CAPTURE_TOKEN)",
+      "/sjp/captured-stop/20506",
+      "/sjp/captured-trip/7120331",
       "/sjp/stop/21911",
       "/sjp/stop/26898",
       "/sjp/group?stops=21911,26898",
@@ -1803,7 +1999,7 @@ app.get("/health", async (req, res) => {
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“", mdash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â", hellip: "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+    ndash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ", mdash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â", hellip: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -2798,6 +2994,140 @@ app.get("/live-stops", async (req, res) => {
       timings: { requestTotalMs: Date.now() - startedAt }
     });
   }
+});
+
+app.post("/capture/sjp", (req, res) => {
+  stats.requests += 1;
+  stats.sjpCaptureIngestRequestsV2252 += 1;
+  if (!sjpCaptureAuthOkV2252(req)) {
+    stats.sjpCaptureRejectedV2252 += 1;
+    return res.status(401).json({ ok: false, error: "Unauthorized capture ingest" });
+  }
+
+  const kind = String(req.body?.kind || req.body?.type || "").trim().toLowerCase();
+  const upstream = req.body?.upstream || req.body?.response || req.body?.payload || null;
+  const receivedAtMs = Date.now();
+  pruneSJPCaptureV2252(receivedAtMs);
+
+  if (kind === "stop") {
+    const payload = buildSJPCapturedStopPayloadV2252(upstream, receivedAtMs);
+    if (!payload) {
+      stats.sjpCaptureRejectedV2252 += 1;
+      return res.status(400).json({ ok: false, error: "Invalid SJP /Stop response payload" });
+    }
+    sjpCapturedStopsV2252.set(payload.stopId, {
+      payload,
+      createdAt: receivedAtMs,
+      expiresAt: receivedAtMs + SJP_CAPTURE_TTL_MS_V2252
+    });
+    for (const service of payload.services || []) {
+      if (!service?.tripId || service.live !== true) continue;
+      const tripPayload = {
+        ok: true,
+        source: "transperth-sjp-mitm-stop-trip-index-v2252",
+        captureBridgeV2252: true,
+        tripId: service.tripId,
+        tripUid: service.tripUid,
+        route: service.route,
+        destination: service.destination,
+        fleetNumber: service.fleetNumber,
+        fleet: service.fleetNumber,
+        vehicleId: service.vehicleId,
+        latitude: service.latitude,
+        longitude: service.longitude,
+        heading: service.heading,
+        liveUpdatedAt: service.liveUpdatedAt,
+        live: true,
+        stopId: payload.stopId,
+        scheduledTime: service.scheduledTime,
+        liveTime: service.liveTime,
+        estimatedArrivalTime: service.estimatedArrivalTime,
+        estimatedDepartureTime: service.estimatedDepartureTime,
+        capturedAt: payload.capturedAt,
+        capturedAtMs: receivedAtMs,
+        fetchedAt: payload.fetchedAt
+      };
+      sjpCapturedTripsV2252.set(service.tripId, {
+        payload: tripPayload,
+        createdAt: receivedAtMs,
+        expiresAt: receivedAtMs + SJP_CAPTURE_TTL_MS_V2252
+      });
+    }
+    stats.sjpCaptureStopPublishesV2252 += 1;
+    pruneSJPCaptureV2252(receivedAtMs);
+    return res.status(202).json({
+      ok: true,
+      kind: "stop",
+      stopId: payload.stopId,
+      count: payload.count,
+      liveCount: payload.liveCount,
+      capturedAt: payload.capturedAt
+    });
+  }
+
+  if (kind === "trip") {
+    const payload = buildSJPCapturedTripPayloadV2252(upstream, receivedAtMs);
+    if (!payload) {
+      stats.sjpCaptureRejectedV2252 += 1;
+      return res.status(400).json({ ok: false, error: "Invalid SJP /Trip response payload" });
+    }
+    sjpCapturedTripsV2252.set(payload.tripId, {
+      payload,
+      createdAt: receivedAtMs,
+      expiresAt: receivedAtMs + SJP_CAPTURE_TTL_MS_V2252
+    });
+    stats.sjpCaptureTripPublishesV2252 += 1;
+    pruneSJPCaptureV2252(receivedAtMs);
+    return res.status(202).json({
+      ok: true,
+      kind: "trip",
+      tripId: payload.tripId,
+      fleetNumber: payload.fleetNumber,
+      live: payload.live,
+      capturedAt: payload.capturedAt
+    });
+  }
+
+  stats.sjpCaptureRejectedV2252 += 1;
+  return res.status(400).json({ ok: false, error: "kind must be stop or trip" });
+});
+
+app.get("/sjp/captured-stop/:stopId", (req, res) => {
+  stats.requests += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  const stopId = String(req.params.stopId || "").trim();
+  if (!/^\d{1,8}$/.test(stopId)) return res.status(400).json({ ok: false, error: "Invalid stop number" });
+  const maxAgeMs = positiveInt(req.query.maxAgeMs, SJP_CAPTURE_TTL_MS_V2252, 1000, SJP_CAPTURE_TTL_MS_V2252);
+  const payload = capturedSJPStopV2252(stopId, maxAgeMs);
+  res.set("Cache-Control", "no-store");
+  if (!payload) {
+    return res.status(404).json({
+      ok: false,
+      source: "transperth-sjp-mitm-capture-v2252",
+      stopId,
+      error: "No fresh captured SJP stop response"
+    });
+  }
+  return res.status(200).json(payload);
+});
+
+app.get("/sjp/captured-trip/:tripId", (req, res) => {
+  stats.requests += 1;
+  if (!authOk(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  const tripId = String(req.params.tripId || "").trim();
+  if (!/^\d{1,12}$/.test(tripId)) return res.status(400).json({ ok: false, error: "Invalid trip id" });
+  const maxAgeMs = positiveInt(req.query.maxAgeMs, SJP_CAPTURE_TTL_MS_V2252, 1000, SJP_CAPTURE_TTL_MS_V2252);
+  const payload = capturedSJPTripV2252(tripId, maxAgeMs);
+  res.set("Cache-Control", "no-store");
+  if (!payload) {
+    return res.status(404).json({
+      ok: false,
+      source: "transperth-sjp-mitm-trip-capture-v2252",
+      tripId,
+      error: "No fresh captured SJP trip response"
+    });
+  }
+  return res.status(200).json(payload);
 });
 
 app.get("/sjp/stop/:stopId", async (req, res) => {
