@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.7.0",
-  "description": "Hubway Transperth browser + official-app SJP response capture bridge (no PhoneApp auth replay)",
+  "version": "3.6.0",
+  "description": "Fast all-ID grouped-stop multiplex server: native keep-alive HTTP, Node streaming parser, verified empty-stop completion, bounded context retry",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
