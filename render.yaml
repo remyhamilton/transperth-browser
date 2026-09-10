@@ -27,9 +27,9 @@ services:
       - key: QUEUE_TIMEOUT_MS
         value: "7000"
       - key: FRESH_CACHE_MS
-        value: "120000"
+        value: "4000"
       - key: STALE_CACHE_MS
-        value: "900000"
+        value: "15000"
       - key: MAX_CACHE_ENTRIES
         value: "160"
       - key: BATCH_MAX_STOPS
@@ -37,7 +37,7 @@ services:
       - key: BATCH_ROW_WAIT_TIMEOUT_MS
         value: "900"
       - key: ATOMIC_COMPONENT_HTTP_CONCURRENCY
-        value: "3"
+        value: "4"
       - key: ATOMIC_COMPONENT_HTTP_TIMEOUT_MS
         value: "2600"
       - key: ATOMIC_COMPONENT_DIRECT_RETRY_ROUNDS
@@ -59,9 +59,9 @@ services:
       - key: ATOMIC_FOREGROUND_PAGE_FALLBACK_V35
         value: "0"
       - key: BATCH_FRESH_CACHE_MS
-        value: "120000"
+        value: "4000"
       - key: BATCH_STALE_CACHE_MS
-        value: "900000"
+        value: "15000"
       - key: BATCH_CACHE_MAX_ENTRIES
         value: "32"
       - key: BATCH_KEEP_WARM_MS
