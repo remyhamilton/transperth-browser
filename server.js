@@ -1788,6 +1788,257 @@ function parseStopHTMLFastV35(entry, limit, liveOnly) {
   };
 }
 
+function parseStopHTMLLooseRowsV38(entry, limit, liveOnly) {
+  const stopId = String(entry?.stopId || "");
+  const html = String(entry?.html || "");
+  const baseURL =
+    `https://136213.mobi/RealTime/RealTimeStopResults.aspx?SN=${encodeURIComponent(stopId)}`;
+
+  // v3.8 fallback: do not depend on perfectly nested HTML. Some MOBI responses can
+  // contain valid timetable row wrappers while their inner markup is malformed or
+  // arranged differently enough that the strict token-stack parser sees the rows but
+  // loses their text. Slice each timetable row from one row opener to the next and
+  // parse its visible text/links independently.
+  const rowOpenPattern =
+    /<[A-Za-z][^>]*\bclass\s*=\s*(?:"[^"]*\btpm_row_timetable\b[^"]*"|'[^']*\btpm_row_timetable\b[^']*')[^>]*>/gi;
+  const openings = [];
+  let match;
+  while ((match = rowOpenPattern.exec(html))) {
+    openings.push({
+      index: match.index,
+      end: rowOpenPattern.lastIndex,
+      openingTag: match[0]
+    });
+  }
+
+  if (!openings.length) {
+    return {
+      stopId,
+      stopName: null,
+      services: [],
+      rawRowCount: 0,
+      liveRowCount: 0,
+      explicitEmpty: false,
+      authoritativeEmpty: false,
+      validStopPage: false,
+      hasTimetableMarkup: false,
+      looseParserV38: true
+    };
+  }
+
+  const bodyText = cleanHTMLTextV35(
+    html
+      .replace(/<script\b[\s\S]*?<\/script\s*>/gi, " ")
+      .replace(/<style\b[\s\S]*?<\/style\s*>/gi, " ")
+      .replace(/<noscript\b[\s\S]*?<\/noscript\s*>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  );
+
+  const explicitEmpty =
+    /\bno\s+more\s+services\s+scheduled\b|\bno\s+(?:live\s+|real[- ]?time\s+|upcoming\s+)?(?:services|departures|results)\b|\bthere\s+are\s+no\b/i
+      .test(bodyText);
+  const pageIdentifiesStop =
+    new RegExp(
+      `(?:Depart\\s+from\\s+stop|Results\\s+for\\s+Stop)\\s*${stopId}\\b`,
+      "i"
+    ).test(bodyText);
+  const helpMarker =
+    /5\s+departure\s+times\s+will\s+be\s+displayed|times\s+are\s+approximate\s+scheduled\s+times/i
+      .test(bodyText);
+  const errorPage =
+    /access\s+denied|captcha|temporarily\s+unavailable|application\s+error|server\s+error|request\s+blocked/i
+      .test(bodyText);
+
+  const allServices = openings.map((opening, index) => {
+    const nextStart =
+      index + 1 < openings.length ? openings[index + 1].index : html.length;
+    const slice = html.slice(opening.index, nextStart);
+    const attrs = parseHTMLAttributesV35(
+      opening.openingTag
+        .replace(/^<\s*[A-Za-z0-9:-]+/, "")
+        .replace(/\/?>\s*$/, "")
+    );
+
+    const text = cleanHTMLTextV35(
+      slice
+        .replace(/<script\b[\s\S]*?<\/script\s*>/gi, " ")
+        .replace(/<style\b[\s\S]*?<\/style\s*>/gi, " ")
+        .replace(/<noscript\b[\s\S]*?<\/noscript\s*>/gi, " ")
+        .replace(/<br\s*\/?>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+    );
+    if (!text) return null;
+
+    const hrefs = [];
+    const hrefPattern =
+      /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi;
+    let hrefMatch;
+    while ((hrefMatch = hrefPattern.exec(slice))) {
+      const href = decodeHTMLTextV35(
+        hrefMatch[1] ?? hrefMatch[2] ?? hrefMatch[3] ?? ""
+      ).trim();
+      if (href) hrefs.push(href);
+    }
+
+    const detailHref =
+      hrefs.find(href => /RealTimeFleetTrip|fleet=/i.test(href || "")) ||
+      null;
+    const detailURL = absoluteURLV35(detailHref, baseURL);
+
+    const routeFromAttr =
+      cleanHTMLTextV35(
+        attrs["data-route"] ||
+        attrs["data-route-number"] ||
+        attrs["data-routeno"] ||
+        ""
+      ) || null;
+
+    // Prefer a route token that occurs before "To <destination>" because the stop
+    // number later in the row is also numeric and must never be mistaken for route.
+    const beforeDestination =
+      text.split(/\bTo\s+/i, 1)[0] || text;
+    const route =
+      routeFromAttr ||
+      beforeDestination.match(
+        /\b([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT|Ferry|Airport Line|Armadale Line|Ellenbrook Line|Fremantle Line|Mandurah Line|Midland Line|Thornlie-Cockburn Line|Yanchep Line)\b/i
+      )?.[1] ||
+      text.match(
+        /\b(?:Route\s*)?([A-Z]?\d{1,4}[A-Z]?|[A-Z]+ CAT|Ferry|Airport Line|Armadale Line|Ellenbrook Line|Fremantle Line|Mandurah Line|Midland Line|Thornlie-Cockburn Line|Yanchep Line)\b/i
+      )?.[1] ||
+      null;
+
+    const destination =
+      cleanHTMLTextV35(
+        attrs["data-destination"] ||
+        attrs["data-dest"] ||
+        ""
+      ) ||
+      text.match(
+        /\bTo\s+.+?(?=\s+Depart\s+from\s+stop\b|\s+\d+\s*MIN\b|\s+\bNOW\b|\s+\(sched\.?\)|\s+\bscheduled\b|$)/i
+      )?.[0]?.trim() ||
+      null;
+
+    const fleet =
+      cleanHTMLTextV35(attrs["data-fleet"]) ||
+      queryValueV35(
+        detailHref,
+        ["fleet", "fleetNumber", "vehicle"],
+        baseURL
+      ) ||
+      text.match(/\bFleet\s*#?\s*(\d{3,5})\b/i)?.[1] ||
+      null;
+
+    const tripId =
+      cleanHTMLTextV35(
+        attrs["data-tripid"] ||
+        attrs["data-trip-id"] ||
+        ""
+      ) ||
+      queryValueV35(
+        detailHref,
+        ["tripId", "tripID", "trip", "t"],
+        baseURL
+      ) ||
+      null;
+
+    const runNumber =
+      cleanHTMLTextV35(attrs["data-run"]) ||
+      text.match(/\b(?:Run|Service)\s*#?\s*([A-Z0-9-]{2,12})\b/i)?.[1] ||
+      null;
+
+    const platform =
+      cleanHTMLTextV35(attrs["data-platform"]) ||
+      text.match(/\bPlatform\s*([0-9]+[A-Z]?)\b/i)?.[1] ||
+      null;
+
+    const scheduled = /\(sched\.?\)|\bscheduled\b/i.test(text);
+    const isLive = !scheduled && (
+      /\bfleet-running\b/i.test(opening.openingTag) ||
+      /\blive\b/i.test(opening.openingTag) ||
+      Boolean(fleet) ||
+      /\bLIVE\b|\barriving\b|\bdeparting\b/i.test(text)
+    );
+
+    const due =
+      text.match(/\b\d+\s*MIN\b/i)?.[0]
+        ?.replace(/\s+/g, " ")
+        .toUpperCase() ||
+      (/\bNOW\b/i.test(text)
+        ? "NOW"
+        : (/\barriving\b/i.test(text) ? "Arriving" : null));
+
+    const dueMinutesMatch = due?.match(/\d+/);
+    const minutesUntilDeparture = dueMinutesMatch
+      ? Number(dueMinutesMatch[0])
+      : ((due === "Arriving" || due === "NOW") ? 0 : null);
+
+    const time =
+      text.match(/\b\d{1,2}[:.]\d{2}\s*(?:am|pm)\b/i)?.[0]
+        ?.replace(/\s+/g, "") ||
+      null;
+
+    if (!route || !destination) return null;
+
+    return {
+      route: cleanHTMLTextV35(route),
+      destination: cleanHTMLTextV35(destination),
+      stopText: "Depart from stop",
+      stopId,
+      due,
+      dueText: due,
+      minutesUntilDeparture,
+      time,
+      departureTime: time,
+      liveTime: isLive ? time : null,
+      statusText: isLive ? "Live" : "Scheduled",
+      scheduled,
+      live: isLive,
+      workerLive: isLive,
+      workerMobiBoardRow: true,
+      workerMobiLiveRow: isLive,
+      workerMobiScheduledRow: !isLive,
+      fleetNumber: fleet,
+      fleet,
+      tripId,
+      runNumber,
+      platform,
+      detailURL:
+        detailURL ||
+        (fleet
+          ? `https://136213.mobi/RealTime/RealTimeFleetTrip.aspx?nq=true&fleet=${encodeURIComponent(fleet)}`
+          : null),
+      rawText: text.slice(0, 420)
+    };
+  }).filter(Boolean);
+
+  const services = (
+    liveOnly
+      ? allServices.filter(service => service.live === true)
+      : allServices
+  ).slice(0, limit);
+
+  return {
+    stopId,
+    stopName: null,
+    services,
+    rawRowCount: allServices.length,
+    liveRowCount: allServices.filter(service => service.live === true).length,
+    explicitEmpty,
+    authoritativeEmpty: Boolean(
+      ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 &&
+      openings.length === 0 &&
+      !errorPage &&
+      pageIdentifiesStop &&
+      (explicitEmpty || helpMarker)
+    ),
+    validStopPage: pageIdentifiesStop && !errorPage,
+    hasTimetableMarkup: openings.length > 0,
+    looseParserV38: true,
+    looseOpeningRowCountV38: openings.length
+  };
+}
+
+
 function parseStopHTMLBatchFastV35(items, limit, liveOnly) {
   const list = Array.isArray(items) ? items.filter(item => item?.ok && item?.html) : [];
   const startedAt = Date.now();
@@ -1920,14 +2171,73 @@ async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
     }
 
     const parseStartedAt = Date.now();
-    const parsed = parseStopHTMLFastV35(direct, limit, liveOnly);
+    const primaryParsedV38 = parseStopHTMLFastV35(
+      direct,
+      limit,
+      liveOnly
+    );
+    let parsed = primaryParsedV38;
+    let parserFallbackUsedV38 = false;
+    let looseParsedV38 = null;
+
+    // v3.8: a valid MOBI page can contain timetable row wrappers while the strict
+    // token-stack parser fails to recover row text from slightly changed/malformed
+    // inner markup. Never turn that into a healthy zero-row board. Retry parsing the
+    // SAME HTML bytes with the loose row-slice parser; this is CPU-only and makes no
+    // second MOBI request.
+    if (
+      !parsed ||
+      (
+        parsed.authoritativeEmpty !== true &&
+        (!Array.isArray(parsed.services) || parsed.services.length === 0)
+      )
+    ) {
+      looseParsedV38 = parseStopHTMLLooseRowsV38(
+        direct,
+        limit,
+        liveOnly
+      );
+      if (
+        Array.isArray(looseParsedV38?.services) &&
+        looseParsedV38.services.length > 0
+      ) {
+        parsed = {
+          ...primaryParsedV38,
+          ...looseParsedV38,
+          stopName:
+            primaryParsedV38?.stopName ||
+            looseParsedV38?.stopName ||
+            `Stop ${stopId}`
+        };
+        parserFallbackUsedV38 = true;
+      }
+    }
+
     const parseMs = Date.now() - parseStartedAt;
 
-    // One successful normal open = one MOBI acquisition. If the returned page
-    // is not a verified timetable/empty board, fail clearly rather than
-    // launching a Chromium retry behind the user's tap.
-    if (!parsed || (!parsed.hasTimetableMarkup && parsed.authoritativeEmpty !== true)) {
-      throw new Error("MOBI stop page did not contain a complete timetable board");
+    // One successful normal open = one MOBI acquisition. An unverified zero is a
+    // parser/upstream failure, not an empty passenger board.
+    if (
+      !parsed ||
+      (
+        parsed.authoritativeEmpty !== true &&
+        (
+          !parsed.hasTimetableMarkup ||
+          !Array.isArray(parsed.services) ||
+          parsed.services.length === 0
+        )
+      )
+    ) {
+      const primaryRowsV38 = Number(
+        primaryParsedV38?.rawRowCount || 0
+      );
+      const looseRowsV38 = Number(
+        looseParsedV38?.rawRowCount || 0
+      );
+      throw new Error(
+        `MOBI timetable present but no passenger rows parsed ` +
+        `(primary=${primaryRowsV38}, loose=${looseRowsV38})`
+      );
     }
 
     const fetchedAt = new Date().toISOString();
@@ -1945,11 +2255,21 @@ async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
       ok: true,
       stopId: String(stopId),
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-native-v3.7-live-stop",
+      source: "136213-native-v3.8-live-stop",
       transportV37: "native-https",
       nativeSingleStopV37: true,
       playwrightUsedV37: false,
       rowWaitUsedV37: false,
+      parserFallbackUsedV38,
+      primaryParsedRowCountV38: Number(
+        primaryParsedV38?.rawRowCount || 0
+      ),
+      looseParsedRowCountV38: Number(
+        looseParsedV38?.rawRowCount || 0
+      ),
+      looseOpeningRowCountV38: Number(
+        looseParsedV38?.looseOpeningRowCountV38 || 0
+      ),
       freshLive: true,
       liveOnly,
       rawRowCount: Number(parsed.rawRowCount || 0),
@@ -2699,7 +3019,7 @@ app.get("/live-stop/:stopId", async (req, res) => {
 
     const totalMs = Date.now() - startedAt;
     res.set("Cache-Control", "no-store");
-    res.set("X-Hubway-Transport", "native-https-v37");
+    res.set("X-Hubway-Transport", "native-https-v38");
     res.set(
       "Server-Timing",
       `mobi;dur=${Number(payload?.timings?.nativeHTTPMsV37 || 0)}, parse;dur=${Number(payload?.timings?.parseMsV37 || 0)}, total;dur=${totalMs}`
@@ -2717,7 +3037,7 @@ app.get("/live-stop/:stopId", async (req, res) => {
     return res.status(504).json({
       ok: false,
       stopId,
-      source: "136213-native-v3.7-live-stop-error",
+      source: "136213-native-v3.8-live-stop-error",
       transportV37: "native-https",
       nativeSingleStopV37: true,
       playwrightUsedV37: false,
