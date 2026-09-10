@@ -43,11 +43,13 @@ const ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 = String(process.env.ATOMIC_ACCEPT_VERIFI
 const ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 = String(process.env.ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 || "0") === "1";
 const ATOMIC_NATIVE_AGENT_V35 = new https.Agent({
   keepAlive: true,
-  maxSockets: 3,
-  maxFreeSockets: 3,
+  // v3.7: 1-4 stop groups are allowed to open every component together.
+  maxSockets: Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY),
+  maxFreeSockets: Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY),
+  keepAliveMsecs: 1000,
   scheduling: "lifo",
   timeout: 10000
- });
+});
 const BATCH_BACKGROUND_REFRESH_ENABLED = String(process.env.BATCH_BACKGROUND_REFRESH_ENABLED || "0") === "1";
 const PREWARM_KNOWN_GROUPS = String(process.env.PREWARM_KNOWN_GROUPS || "0") === "1";
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 120000, 1000, 300000);
@@ -84,6 +86,9 @@ const availablePages = [];
 const waiters = [];
 const cache = new Map();
 const inFlight = new Map();
+// v3.7: normal /live-stop opens use one native keep-alive request and share
+// simultaneous requests for the same stop instead of consuming Chromium pages.
+const nativeStopInFlightV37 = new Map();
 const batchCache = new Map();
 const batchInFlight = new Map();
 const atomicComponentBatchInFlightV32 = new Map();
@@ -156,7 +161,13 @@ const stats = {
   atomicContextRetryFetchesV35: 0,
   atomicFastParserDocumentsV35: 0,
   atomicVerifiedEmptyComponentsV35: 0,
-  atomicPageFallbacksSkippedV35: 0
+  atomicPageFallbacksSkippedV35: 0,
+  nativeSingleStopRequestsV37: 0,
+  nativeSingleStopFetchesV37: 0,
+  nativeSingleStopCacheHitsV37: 0,
+  nativeSingleStopCoalescedV37: 0,
+  nativeSingleStopScheduledOnlyV37: 0,
+  nativeSingleStopErrorsV37: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -1534,7 +1545,7 @@ app.get("/health", async (req, res) => {
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“", mdash: "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â", hellip: "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+    ndash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ", mdash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â", hellip: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -1849,6 +1860,133 @@ async function fetchStopHTMLNativeV35(stopId) {
   else stats.atomicNativeHTTPErrorsV35 += 1;
   return { stopId: String(stopId), ...response, ms: Date.now() - startedAt, transportV35: "native-https" };
 }
+
+async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
+  const liveOnly = options.liveOnly === true;
+  const allowStale = options.allowStale === true;
+  const strictFresh = options.strictFresh === true;
+  const allowHotCache = options.allowHotCache !== false;
+  const key = cacheKey(stopId, limit, liveOnly);
+
+  // "fresh=1" may still use the tiny healthy hot cache. Use strictFresh=1
+  // only when a caller truly requires another origin request.
+  if (allowHotCache && !strictFresh) {
+    const cached = getCache(key, false);
+    if (cached?.payload?.ok === true) {
+      stats.nativeSingleStopCacheHitsV37 += 1;
+      return {
+        ...cached.payload,
+        cache: { hit: true, stale: false, ageMs: cached.ageMs, hotNativeV37: true },
+        timings: {
+          ...(cached.payload.timings || {}),
+          nativeHTTPMsV37: 0,
+          parseMsV37: 0,
+          totalMs: 0
+        }
+      };
+    }
+  }
+
+  const inFlightKey = `native-v37|${key}`;
+  const existing = nativeStopInFlightV37.get(inFlightKey);
+  if (existing) {
+    stats.nativeSingleStopCoalescedV37 += 1;
+    const payload = await existing;
+    return {
+      ...payload,
+      cache: { hit: false, coalesced: true, hotNativeV37: true }
+    };
+  }
+
+  const promise = (async () => {
+    const startedAt = Date.now();
+    stats.nativeSingleStopFetchesV37 += 1;
+
+    const direct = await fetchStopHTMLNativeV35(stopId);
+    if (!direct?.ok || !direct?.html) {
+      if (allowStale) {
+        const stale = getCache(key, true);
+        if (stale?.payload?.ok === true) {
+          stats.staleRescues += 1;
+          return {
+            ...stale.payload,
+            degraded: true,
+            warning: direct?.error || "Native MOBI fetch failed",
+            cache: { hit: true, stale: true, ageMs: stale.ageMs, hotNativeV37: true }
+          };
+        }
+      }
+      throw new Error(direct?.error || `Native MOBI HTTP ${Number(direct?.status || 0)}`);
+    }
+
+    const parseStartedAt = Date.now();
+    const parsed = parseStopHTMLFastV35(direct, limit, liveOnly);
+    const parseMs = Date.now() - parseStartedAt;
+
+    // One successful normal open = one MOBI acquisition. If the returned page
+    // is not a verified timetable/empty board, fail clearly rather than
+    // launching a Chromium retry behind the user's tap.
+    if (!parsed || (!parsed.hasTimetableMarkup && parsed.authoritativeEmpty !== true)) {
+      throw new Error("MOBI stop page did not contain a complete timetable board");
+    }
+
+    const fetchedAt = new Date().toISOString();
+    const services = (parsed.services || []).map(service => ({
+      ...service,
+      observedAt: fetchedAt,
+      liveFetchedAt: fetchedAt
+    }));
+    const liveCount = services.filter(service => service?.live === true).length;
+    if (services.length > 0 && liveCount === 0) {
+      stats.nativeSingleStopScheduledOnlyV37 += 1;
+    }
+
+    const payload = {
+      ok: true,
+      stopId: String(stopId),
+      stopName: parsed.stopName || `Stop ${stopId}`,
+      source: "136213-native-v3.7-live-stop",
+      transportV37: "native-https",
+      nativeSingleStopV37: true,
+      playwrightUsedV37: false,
+      rowWaitUsedV37: false,
+      freshLive: true,
+      liveOnly,
+      rawRowCount: Number(parsed.rawRowCount || 0),
+      liveRowCount: Number(parsed.liveRowCount || 0),
+      count: services.length,
+      services,
+      authoritativeEmptyBoard: parsed.authoritativeEmpty === true,
+      fetchedAt,
+      timings: {
+        nativeHTTPMsV37: Number(direct.ms || 0),
+        parseMsV37: parseMs,
+        // Retain this compatibility field for existing Worker diagnostics.
+        browserMs: Number(direct.ms || 0),
+        rowWaitMs: 0,
+        totalMs: Date.now() - startedAt
+      }
+    };
+
+    // Keep only healthy live boards (or verified empties) in the tiny hot cache.
+    // Scheduled-only responses never suppress the next real live check.
+    if (liveCount > 0 || payload.authoritativeEmptyBoard === true) {
+      setCache(key, payload);
+    }
+
+    return payload;
+  })();
+
+  nativeStopInFlightV37.set(inFlightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (nativeStopInFlightV37.get(inFlightKey) === promise) {
+      nativeStopInFlightV37.delete(inFlightKey);
+    }
+  }
+}
+
 
 async function fetchStopHTMLDirectV32(stopId) {
   await ensureBrowser();
@@ -2533,6 +2671,7 @@ app.get("/live-stops", async (req, res) => {
 
 app.get("/live-stop/:stopId", async (req, res) => {
   stats.requests += 1;
+  stats.nativeSingleStopRequestsV37 += 1;
   if (!authOk(req)) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
@@ -2541,34 +2680,48 @@ app.get("/live-stop/:stopId", async (req, res) => {
   if (!/^\d{1,8}$/.test(stopId)) {
     return res.status(400).json({ ok: false, error: "Invalid stop number" });
   }
+
   const limit = positiveInt(req.query.limit, 5, 1, 24);
   const forceRefresh = String(req.query.fresh || req.query.refresh || "") === "1";
+  const strictFresh = String(req.query.strictFresh || "") === "1";
   const liveOnly = String(req.query.liveOnly || req.query.live || "") === "1";
   const allowStale = !forceRefresh && String(req.query.allowStale || "1") !== "0";
+  const allowHotCache = String(req.query.hotCache || "1") !== "0";
   const startedAt = Date.now();
 
   try {
-    const payload = await fetchStopShared(stopId, limit, {
-      forceRefresh,
+    const payload = await fetchNativeLiveStopV37(stopId, limit, {
       liveOnly,
       allowStale,
-      cacheResult: !forceRefresh,
-      rowWaitMs: liveOnly ? LIVE_ROW_WAIT_TIMEOUT_MS : undefined
+      allowHotCache,
+      strictFresh
     });
+
+    const totalMs = Date.now() - startedAt;
     res.set("Cache-Control", "no-store");
+    res.set("X-Hubway-Transport", "native-https-v37");
+    res.set(
+      "Server-Timing",
+      `mobi;dur=${Number(payload?.timings?.nativeHTTPMsV37 || 0)}, parse;dur=${Number(payload?.timings?.parseMsV37 || 0)}, total;dur=${totalMs}`
+    );
     return res.json({
       ...payload,
-      timings: {
-        ...(payload.timings || {}),
-        totalMs: Date.now() - startedAt
-      }
+      forceRefreshRequestedV37: forceRefresh,
+      strictFreshV37: strictFresh,
+      hotCacheAllowedV37: allowHotCache,
+      timings: { ...(payload.timings || {}), totalMs }
     });
   } catch (error) {
-    const message = String(error.message || error);
-    const status = /queue timeout/i.test(message) ? 503 : 504;
-    return res.status(status).json({
+    stats.nativeSingleStopErrorsV37 += 1;
+    const message = String(error?.message || error);
+    return res.status(504).json({
       ok: false,
       stopId,
+      source: "136213-native-v3.7-live-stop-error",
+      transportV37: "native-https",
+      nativeSingleStopV37: true,
+      playwrightUsedV37: false,
+      automaticPageFallbackV37: false,
       error: message,
       fetchedAt: new Date().toISOString(),
       timings: { totalMs: Date.now() - startedAt }
