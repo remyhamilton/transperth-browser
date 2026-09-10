@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.6.0",
-  "description": "Fast all-ID grouped-stop multiplex server: native keep-alive HTTP, Node streaming parser, verified empty-stop completion, bounded context retry",
+  "version": "3.7.0",
+  "description": "Native-first Transperth stop server: one keep-alive MOBI fetch, fast Node parser, 4-stop parallel groups, Playwright removed from normal live-stop opens",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
