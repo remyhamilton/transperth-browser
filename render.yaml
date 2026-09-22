@@ -52,6 +52,10 @@ services:
         value: "1500000"
       - key: ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35
         value: "4200"
+      - key: FOREGROUND_NATIVE_HTTP_CONCURRENCY_V39
+        value: "4"
+      - key: NATIVE_ORIGIN_SOCKET_TIMEOUT_MS_V39
+        value: "60000"
       - key: ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35
         value: "2600"
       - key: ATOMIC_ACCEPT_VERIFIED_EMPTY_V35
