@@ -1,7 +1,7 @@
 {
   "name": "transperth-browser",
-  "version": "3.7.0",
-  "description": "Native-first Transperth stop server: one keep-alive MOBI fetch, fast Node parser, 4-stop parallel groups, Playwright removed from normal live-stop opens",
+  "version": "3.9.0",
+  "description": "Foreground-native Transperth stop server: dedicated keep-alive passenger lane, lazy Playwright fallback, fast Node parser, atomic grouped native HTTP",
   "main": "server.js",
   "scripts": {
     "start": "node --expose-gc server.js",
