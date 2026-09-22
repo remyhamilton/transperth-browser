@@ -41,15 +41,41 @@ const ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35 = positiveInt(process.env.ATOMIC_NATIVE_
 const ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35 = positiveInt(process.env.ATOMIC_CONTEXT_RETRY_TIMEOUT_MS_V35, 2600, 800, 6000);
 const ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 = String(process.env.ATOMIC_ACCEPT_VERIFIED_EMPTY_V35 || "1") !== "0";
 const ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 = String(process.env.ATOMIC_FOREGROUND_PAGE_FALLBACK_V35 || "0") === "1";
-const ATOMIC_NATIVE_AGENT_V35 = new https.Agent({
-  keepAlive: true,
-  // v3.7: 1-4 stop groups are allowed to open every component together.
-  maxSockets: Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY),
-  maxFreeSockets: Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY),
-  keepAliveMsecs: 1000,
-  scheduling: "lifo",
-  timeout: 10000
-});
+// v3.9: normal passenger Stop opens have a dedicated origin socket lane. Grouped/
+// batch work must never consume every 136213.mobi socket and make a foreground
+// single-stop request wait behind unrelated work. This changes transport scheduling
+// only; row parsing/authority/content remain identical.
+const FOREGROUND_NATIVE_HTTP_CONCURRENCY_V39 = positiveInt(
+  process.env.FOREGROUND_NATIVE_HTTP_CONCURRENCY_V39,
+  4,
+  1,
+  8
+);
+const NATIVE_ORIGIN_SOCKET_TIMEOUT_MS_V39 = positiveInt(
+  process.env.NATIVE_ORIGIN_SOCKET_TIMEOUT_MS_V39,
+  60000,
+  10000,
+  180000
+);
+function nativeOriginAgentV39(maxSockets) {
+  return new https.Agent({
+    keepAlive: true,
+    maxSockets,
+    maxFreeSockets: maxSockets,
+    keepAliveMsecs: 1000,
+    scheduling: "lifo",
+    // v3.9: v3.8 discarded otherwise-reusable origin sockets after only ~10 s.
+    // Keep them available across normal passenger interactions so TCP/TLS setup is
+    // avoided whenever the origin permits it. Request-level timeouts remain bounded.
+    timeout: NATIVE_ORIGIN_SOCKET_TIMEOUT_MS_V39
+  });
+}
+const ATOMIC_NATIVE_AGENT_V35 = nativeOriginAgentV39(
+  Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY)
+);
+const FOREGROUND_NATIVE_AGENT_V39 = nativeOriginAgentV39(
+  FOREGROUND_NATIVE_HTTP_CONCURRENCY_V39
+);
 const BATCH_BACKGROUND_REFRESH_ENABLED = String(process.env.BATCH_BACKGROUND_REFRESH_ENABLED || "0") === "1";
 const PREWARM_KNOWN_GROUPS = String(process.env.PREWARM_KNOWN_GROUPS || "0") === "1";
 const BATCH_FRESH_CACHE_MS = positiveInt(process.env.BATCH_FRESH_CACHE_MS, 120000, 1000, 300000);
@@ -167,7 +193,9 @@ const stats = {
   nativeSingleStopCacheHitsV37: 0,
   nativeSingleStopCoalescedV37: 0,
   nativeSingleStopScheduledOnlyV37: 0,
-  nativeSingleStopErrorsV37: 0
+  nativeSingleStopErrorsV37: 0,
+  nativeForegroundSocketReusesV39: 0,
+  nativeForegroundFreshSocketsV39: 0
 };
 
 function positiveInt(value, fallback, min, max) {
@@ -1496,7 +1524,7 @@ app.get("/warm-service-packets/status", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "transperth-browser-v3.5",
+    service: "transperth-browser-v3.9",
     region: process.env.RENDER_REGION || null,
     poolSize: POOL_SIZE,
     availablePages: availablePages.length,
@@ -1522,20 +1550,19 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", async (req, res) => {
-  try {
-    await ensureBrowser();
-    res.status(200).json({
-      ok: true,
-      browserConnected: Boolean(browser?.isConnected()),
-      poolSize: POOL_SIZE,
-      availablePages: availablePages.length,
-      queuedRequests: waiters.length,
-      memory: lastMemorySnapshot || memorySnapshot()
-    });
-  } catch (error) {
-    res.status(503).json({ ok: false, error: String(error.message || error) });
-  }
+app.get("/health", (req, res) => {
+  // v3.9: health of the native foreground lane must not force Chromium to launch.
+  // Browser-dependent legacy/fallback endpoints still call ensureBrowser() on demand.
+  res.status(200).json({
+    ok: true,
+    nativeForegroundReadyV39: true,
+    browserLazyV39: true,
+    browserConnected: Boolean(browser?.isConnected()),
+    poolSize: POOL_SIZE,
+    availablePages: availablePages.length,
+    queuedRequests: waiters.length,
+    memory: lastMemorySnapshot || memorySnapshot()
+  });
 });
 
 
@@ -1545,7 +1572,7 @@ app.get("/health", async (req, res) => {
 function decodeHTMLTextV35(value) {
   const named = {
     amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-    ndash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ", mdash: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â", hellip: "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦"
+    ndash: "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“", mdash: "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â", hellip: "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"
   };
   return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token) => {
     const lower = String(token).toLowerCase();
@@ -2049,7 +2076,7 @@ function parseStopHTMLBatchFastV35(items, limit, liveOnly) {
   return parsed;
 }
 
-function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
+function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2, agent = ATOMIC_NATIVE_AGENT_V35) {
   return new Promise(resolve => {
     let settled = false;
     const finish = value => {
@@ -2057,8 +2084,14 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
       settled = true;
       resolve(value);
     };
+    const startedAtV39 = Date.now();
+    let socketAssignedAtV39 = null;
+    let lookupAtV39 = null;
+    let connectAtV39 = null;
+    let secureConnectAtV39 = null;
+    let responseAtV39 = null;
     const request = https.get(targetURL, {
-      agent: ATOMIC_NATIVE_AGENT_V35,
+      agent,
       headers: {
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Encoding": "identity",
@@ -2071,6 +2104,7 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
       }
     }, response => {
+      responseAtV39 = Date.now();
       const status = Number(response.statusCode || 0);
       const location = response.headers.location;
       if ([301, 302, 303, 307, 308].includes(status) && location && redirectsLeft > 0) {
@@ -2078,7 +2112,7 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
         let redirected = null;
         try { redirected = new URL(location, targetURL).toString(); } catch {}
         if (!redirected) return finish({ ok: false, status, html: "", error: "Invalid redirect" });
-        void nativeHTTPSGetV35(redirected, timeoutMs, redirectsLeft - 1).then(finish);
+        void nativeHTTPSGetV35(redirected, timeoutMs, redirectsLeft - 1, agent).then(finish);
         return;
       }
       const chunks = [];
@@ -2092,24 +2126,65 @@ function nativeHTTPSGetV35(targetURL, timeoutMs, redirectsLeft = 2) {
         chunks.push(chunk);
       });
       response.on("end", () => {
+        const endedAtV39 = Date.now();
         const html = Buffer.concat(chunks).toString("utf8");
         const ok = status >= 200 && status < 400 && /<html|<!doctype/i.test(html);
-        finish({ ok, status, html: ok ? html : "", error: ok ? null : `MOBI HTTP ${status}` });
+        finish({
+          ok,
+          status,
+          html: ok ? html : "",
+          error: ok ? null : `MOBI HTTP ${status}`,
+          transportTimingsV39: {
+            reusedSocket: request.reusedSocket === true,
+            socketAssignMs: socketAssignedAtV39 ? Math.max(0, socketAssignedAtV39 - startedAtV39) : 0,
+            dnsMs: lookupAtV39 && socketAssignedAtV39 ? Math.max(0, lookupAtV39 - socketAssignedAtV39) : 0,
+            tcpMs: connectAtV39 && lookupAtV39 ? Math.max(0, connectAtV39 - lookupAtV39) : 0,
+            tlsMs: secureConnectAtV39 && connectAtV39 ? Math.max(0, secureConnectAtV39 - connectAtV39) : 0,
+            ttfbMs: responseAtV39 ? Math.max(0, responseAtV39 - startedAtV39) : 0,
+            bodyMs: responseAtV39 ? Math.max(0, endedAtV39 - responseAtV39) : 0,
+            totalMs: Math.max(0, endedAtV39 - startedAtV39)
+          }
+        });
       });
       response.on("error", error => finish({ ok: false, status, html: "", error: String(error?.message || error) }));
+    });
+    request.on("socket", socket => {
+      socketAssignedAtV39 = Date.now();
+      // Reused keep-alive sockets have already completed DNS/TCP/TLS. Do not attach
+      // one-shot listeners that can never fire and would accumulate across requests.
+      if (request.reusedSocket !== true) {
+        socket.once("lookup", () => { lookupAtV39 = Date.now(); });
+        socket.once("connect", () => { connectAtV39 = Date.now(); });
+        socket.once("secureConnect", () => { secureConnectAtV39 = Date.now(); });
+      }
     });
     request.setTimeout(timeoutMs, () => request.destroy(new Error("native-stop-timeout")));
     request.on("error", error => finish({ ok: false, status: 0, html: "", error: String(error?.message || error) }));
   });
 }
 
-async function fetchStopHTMLNativeV35(stopId) {
+async function fetchStopHTMLNativeV35(stopId, options = {}) {
   stats.atomicNativeHTTPFetchesV35 += 1;
   const startedAt = Date.now();
-  const response = await nativeHTTPSGetV35(stopUrl(stopId), ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35);
+  const foregroundV39 = options?.foregroundV39 === true;
+  const response = await nativeHTTPSGetV35(
+    stopUrl(stopId),
+    ATOMIC_NATIVE_HTTP_TIMEOUT_MS_V35,
+    2,
+    foregroundV39 ? FOREGROUND_NATIVE_AGENT_V39 : ATOMIC_NATIVE_AGENT_V35
+  );
   if (response.ok) stats.atomicNativeHTTPSuccessesV35 += 1;
   else stats.atomicNativeHTTPErrorsV35 += 1;
-  return { stopId: String(stopId), ...response, ms: Date.now() - startedAt, transportV35: "native-https" };
+  if (foregroundV39) {
+    if (response?.transportTimingsV39?.reusedSocket === true) stats.nativeForegroundSocketReusesV39 += 1;
+    else stats.nativeForegroundFreshSocketsV39 += 1;
+  }
+  return {
+    stopId: String(stopId),
+    ...response,
+    ms: Date.now() - startedAt,
+    transportV35: foregroundV39 ? "native-https-foreground-v39" : "native-https"
+  };
 }
 
 async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
@@ -2153,7 +2228,7 @@ async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
     const startedAt = Date.now();
     stats.nativeSingleStopFetchesV37 += 1;
 
-    const direct = await fetchStopHTMLNativeV35(stopId);
+    const direct = await fetchStopHTMLNativeV35(stopId, { foregroundV39: true });
     if (!direct?.ok || !direct?.html) {
       if (allowStale) {
         const stale = getCache(key, true);
@@ -2255,8 +2330,8 @@ async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
       ok: true,
       stopId: String(stopId),
       stopName: parsed.stopName || `Stop ${stopId}`,
-      source: "136213-native-v3.8-live-stop",
-      transportV37: "native-https",
+      source: "136213-native-v3.9-live-stop",
+      transportV37: "native-https-foreground-v39",
       nativeSingleStopV37: true,
       playwrightUsedV37: false,
       rowWaitUsedV37: false,
@@ -2281,6 +2356,13 @@ async function fetchNativeLiveStopV37(stopId, limit, options = {}) {
       timings: {
         nativeHTTPMsV37: Number(direct.ms || 0),
         parseMsV37: parseMs,
+        nativeSocketReusedV39: direct?.transportTimingsV39?.reusedSocket === true,
+        nativeSocketAssignMsV39: Number(direct?.transportTimingsV39?.socketAssignMs || 0),
+        nativeDNSMsV39: Number(direct?.transportTimingsV39?.dnsMs || 0),
+        nativeTCPMsV39: Number(direct?.transportTimingsV39?.tcpMs || 0),
+        nativeTLSMsV39: Number(direct?.transportTimingsV39?.tlsMs || 0),
+        nativeTTFBMsV39: Number(direct?.transportTimingsV39?.ttfbMs || 0),
+        nativeBodyMsV39: Number(direct?.transportTimingsV39?.bodyMs || 0),
         // Retain this compatibility field for existing Worker diagnostics.
         browserMs: Number(direct.ms || 0),
         rowWaitMs: 0,
@@ -3019,7 +3101,7 @@ app.get("/live-stop/:stopId", async (req, res) => {
 
     const totalMs = Date.now() - startedAt;
     res.set("Cache-Control", "no-store");
-    res.set("X-Hubway-Transport", "native-https-v38");
+    res.set("X-Hubway-Transport", "native-https-foreground-v39");
     res.set(
       "Server-Timing",
       `mobi;dur=${Number(payload?.timings?.nativeHTTPMsV37 || 0)}, parse;dur=${Number(payload?.timings?.parseMsV37 || 0)}, total;dur=${totalMs}`
@@ -3037,8 +3119,8 @@ app.get("/live-stop/:stopId", async (req, res) => {
     return res.status(504).json({
       ok: false,
       stopId,
-      source: "136213-native-v3.8-live-stop-error",
-      transportV37: "native-https",
+      source: "136213-native-v3.9-live-stop-error",
+      transportV37: "native-https-foreground-v39",
       nativeSingleStopV37: true,
       playwrightUsedV37: false,
       automaticPageFallbackV37: false,
@@ -3074,15 +3156,18 @@ process.on("uncaughtException", error => {
 
 app.listen(PORT, async () => {
   try {
-    await ensureBrowser();
-    console.log(`Transperth browser v3.6 pressure-governor listening on port ${PORT}; pool=${POOL_SIZE}; mobiConcurrency=${ATOMIC_COMPONENT_HTTP_CONCURRENCY}`);
-    console.log(`Playwright Chromium: ${chromium.executablePath()}`);
+    // v3.9: normal /live-stop is native HTTPS and does not require Playwright.
+    // Keep Chromium completely lazy so foreground passenger requests get the CPU/RAM
+    // and the service reaches ready state without a browser launch on startup.
+    console.log(`Transperth browser v3.9 foreground-native listening on port ${PORT}; foregroundSockets=${FOREGROUND_NATIVE_HTTP_CONCURRENCY_V39}; atomicSockets=${Math.max(4, ATOMIC_COMPONENT_HTTP_CONCURRENCY)}; originSocketTimeoutMs=${NATIVE_ORIGIN_SOCKET_TIMEOUT_MS_V39}`);
+    console.log(`Playwright Chromium lazy: ${chromium.executablePath()}`);
     if (PREWARM_KNOWN_GROUPS) {
+      await ensureBrowser();
       void prewarmKnownGroupedStops().then(() => {
         console.log("Known grouped-stop caches prewarmed.");
       });
     } else {
-      console.log("v3.6 pressure governor: startup grouped prewarm disabled.");
+      console.log("v3.9 foreground-native: startup Chromium launch and grouped prewarm disabled.");
     }
 
     if (BATCH_BACKGROUND_REFRESH_ENABLED) {
